@@ -37,30 +37,48 @@ a change that touches a key file or a `.env` file with secret-like values blocks
 ## Secret policy and completeness
 
 gitleaks runs with its built-in rules only; the scanned repository's `.gitleaks.toml`, `.gitleaksignore` and
-inline `gitleaks:allow` comments are ignored. gitleaks never reads the repository: the scanner writes the
-content to scan as small pieces in a private folder and gitleaks scans that folder.
+inline `gitleaks:allow` comments are ignored. gitleaks never reads the repository: the scanner writes each
+*unit* (a file in `tree` mode; the lines one commit adds to one file otherwise) into a private folder, named
+only by file-type class (`.php`, `.tf`, `.yaml`, `nuget.config`, otherwise `.txt`), and gitleaks scans two
+folders:
 
-- Each piece holds at most 24 KB of content, overlapping the previous piece by 8 KB, so any match up to 8 KB long
-  lies wholly inside one piece. gitleaks only splits input above 100 KB, so it never cuts a piece.
-- Each piece starts with a 1 KB text guard. gitleaks skips input whose first bytes look like a binary file
-  type (PDF, archives, executables, fonts, Office files; up to byte 32,773 for ISO images), so without the guard
-  a file starting with such bytes would go unscanned. With the guard and pieces under 32,773 bytes, no file-type
-  signature can match.
-- Pieces are named by file-type class only (`.php`, `.tf`, `.yaml`, `nuget.config`, otherwise `.txt`). The four
-  content rules that gitleaks applies only to matching paths (Freemius/PHP, Terraform/HCL, Kubernetes Secret
-  YAML, nuget.config) therefore still run, while path exclusions in the default policy (lockfiles, images,
-  `node_modules`, `vendor/...`, files named like `gitleaks.toml`) can never match. The one path-only rule
-  (`.p12`/`.pfx` files) is covered by the scanner's own key-file check.
-- The scan fails (exit 2) unless gitleaks reports exactly the number of bytes the scanner wrote, so a skipped
-  piece cannot pass silently. Any gitleaks error, warning about skipped input, non-zero exit other than the
-  findings code, or death by signal also exits 2.
+1. **Each unit as it is.** This is exactly what gitleaks alone would scan for that unit, so the scan finds at
+   least everything gitleaks itself finds there, with the same context.
+2. **Guarded windows.** Each copy starts with a 1 KB text guard and holds at most 98,000 bytes of the unit,
+   overlapping the previous window by 49,000 bytes. They close three gitleaks blind spots:
+   - gitleaks skips input whose first bytes look like a binary file type (PDF, archives, executables, fonts,
+     Office files), logging that only at debug level; the guard stops that;
+   - gitleaks cuts long input at about 125 KB with no overlap; a window stays under its 100 KB buffer, so it is
+     never cut, and any span up to 49,000 bytes lies wholly inside one window;
+   - a unit up to 98,000 bytes is one window, scanned whole with full context however it starts.
+   The scan fails (exit 2) unless gitleaks reports exactly the bytes written for the windows. The only file-type
+   matcher that can still reach past the guard, ISO-9660 at byte 32,769, therefore causes an error, never a
+   silent pass.
+
+Class names keep the four content rules gitleaks applies only to matching paths (Freemius/PHP, Terraform/HCL,
+Kubernetes Secret YAML, nuget.config), while the default policy's path exclusions (lockfiles, images,
+`node_modules`, `vendor/...`, files named like `gitleaks.toml`) never match. The one path-only rule
+(`.p12`/`.pfx` files) is covered by the scanner's own key-file check.
+
+**Byte coverage is not detection completeness.** The byte check proves every byte of every window reached
+gitleaks; it cannot prove that every rule would match. Limits that remain:
+- a rule whose evidence is spread over more than 49,000 bytes of a unit larger than 98,000 bytes is only found
+  where gitleaks' own scan of that unit (run 1) happens to keep the evidence together;
+- in `staged`/`range` mode only added lines are units, so evidence split between changed and unchanged lines
+  can be missed there (the `tree` scan of the payload sees whole files);
+- detection is only as good as gitleaks 8.30.1's rules.
+
+Any gitleaks error, warning about failures, non-zero exit other than the findings code, or death by signal
+exits 2.
 
 ## Archives
 
 Archives are not unpacked. `tree` mode blocks them by name (`.zip`, `.tar`, `.gz`, `.7z`, `.jar`, `.whl`,
-`.gem`, `.docx`, `.pptx`, ...) and by content (zip, gzip, bzip2, xz, 7z, rar, zstd and tar signatures), because
-their contents would go unscanned. In `staged`/`range` mode an archive's bytes are scanned as text, which does
-not reach compressed content; spreadsheets are blocked by the data-file check.
+`.gem`, `.docx`, `.pptx`, ...) and by content: a zip, gzip, bzip2, xz, 7z, rar, zstd, cab or tar signature
+*anywhere* in a file blocks it, so a prefixed or self-extracting archive with an innocent name is caught too
+(at the cost of an occasional false block on binary files, which are not expected in a deploy payload). In
+`staged`/`range` mode an archive's bytes are scanned as text, which does not reach compressed content;
+spreadsheets are blocked by the data-file check.
 
 ## Range semantics
 
@@ -82,8 +100,12 @@ exit `2`.
 
 Set by the caller: `SCAN_ALLOW_DATA_FILES=true` turns data-file findings into warnings (synthetic fixtures);
 `GITLEAKS` sets the gitleaks binary. Markdown files are excluded from the risky-pattern check only; gitleaks
-still scans them. `GIT_DIR`, `GIT_INDEX_FILE` and similar variables are honoured as git defines them (hooks
-use them); the work-tree root check confirms which checkout is scanned.
+still scans them.
+
+**The caller is trusted.** `PATH`, `GITLEAKS`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and bash/perl startup
+settings all control what runs and which repository is read (hooks rely on some of them). The work-tree root
+check confirms the current folder is the work tree being scanned; it does not bind an arbitrary `GIT_DIR` to
+it. Run the scanner from a clean, known environment (in CI: a fresh runner).
 
 ## Using it in CI
 
@@ -101,4 +123,5 @@ use them); the work-tree root check confirms which checkout is scanned.
 
 `tests/run-tests.sh` (bash, git, perl, gitleaks). CI runs them on Linux and on macOS with the system
 `/bin/bash` 3.2. Fixture setup fails fast: an error while building a fixture aborts the suite with exit 2
-instead of counting as a pass. Key regressions assert the expected diagnostic as well as the exit code.
+instead of counting as a pass. Key regressions assert the expected diagnostic as well as the exit code, and
+each safeguard has at least one test that fails without it (checked by mutation).

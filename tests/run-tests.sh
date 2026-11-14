@@ -378,5 +378,42 @@ D=$(rangerepo v4-quoted-code); B=$(git -C "$D" rev-parse HEAD)
 printf 'blob.make_public()\n' >"$D/q\"uote.py"; git -C "$D" add "q\"uote.py"; commit "$D" q
 expect_msg 1 'public storage objects' "parser: code file with a quote in its name is checked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
 
+# ---------------- v5 regression tests (Codex review of v4) ----------------
+afill() { perl -e 'print "a" x $ARGV[0]' "$1"; }
+SGTOK="3fa85f64$(printf %s 57174562b3fc2c963f66afa61c9e8b2d)"   # assembled at run time: no literal in this file
+ctxcase() {  # ctxcase <name> <file>: range, staged and tree runs must all report a secret
+  local d; d=$(rangerepo "v5-$1"); local b; b=$(git -C "$d" rev-parse HEAD)
+  cp "$2" "$d/$1.txt"; git -C "$d" add "$1.txt"; commit "$d" ctx
+  expect_msg 1 "$SECRET" "range: $1" bash -c "cd '$d' && '$SCAN' range $b HEAD"
+  d=$(newrepo "v5-$1-staged"); put "$d" README.txt base; commit "$d" init; cp "$2" "$d/$1.txt"; git -C "$d" add "$1.txt"
+  expect_msg 1 "$SECRET" "staged: $1" bash -c "cd '$d' && '$SCAN' staged"
+  local t="$WORK/tree-v5-$1"; mkdir -p "$t"; cp "$2" "$t/$1.txt"
+  expect_msg 1 "$SECRET" "tree: $1" "$SCAN" tree "$t"
+}
+# P1-1: rules whose context spans more than a piece (curl credentials after a 26 KB URL; a bare token whose
+# keyword is 26 KB away; the same 40 KB away inside a 150 KB file)
+F="$WORK/ctx-curl"; { printf 'curl "https://example.com/'; afill 26000; printf '" -u "admin:%s"\n' "Kq7v$(printf %s Rt2mZpXw9Lb3)"; } >"$F"
+ctxcase curl-long-url "$F"
+# (a bare 40-hex token only counts when "sourcegraph" is in the same gitleaks fragment)
+F="$WORK/ctx-sg"; { printf '%s\n' "$SGTOK"; afill 26000; printf '\nsourcegraph\n'; } >"$F"
+ctxcase keyword-26kb-away "$F"
+# caught only by the whole-unit run: keyword 110 KB after the token in a 120 KB file (native context)
+F="$WORK/ctx-whole"; { printf '%s\n' "$SGTOK"; afill 110000; printf '\nsourcegraph\n'; afill 8000; printf '\n'; } >"$F"
+ctxcase keyword-110kb-away-in-120kb "$F"
+# caught only by the windows: gitleaks alone cuts at 125 KB between keyword (118 KB) and token (130 KB)
+F="$WORK/ctx-window"; { afill 118000; printf '\nsourcegraph\n'; afill 12000; printf '\n%s\n' "$SGTOK"; afill 30000; printf '\n'; } >"$F"
+ctxcase keyword-across-gitleaks-cut "$F"
+# 30 KB between keyword (110 KB) and token (140 KB), across gitleaks' cut: needs the 98 KB windows
+F="$WORK/ctx-window30"; { afill 110000; printf '\nsourcegraph\n'; afill 30000; printf '\n%s\n' "$SGTOK"; afill 20000; printf '\n'; } >"$F"
+ctxcase keyword-30kb-before-token-across-cut "$F"
+
+# P1-2: archives with a prefix and an innocent name are still recognised
+T="$WORK/tree-v5-prefixzip"; mkdir -p "$T"; echo ok >"$T/main.py"
+{ printf 'XX'; git -C "$R" archive --format=zip HEAD; } >"$T/payload.dat"
+expect_msg 1 'archives' "tree: zip with a leading prefix and a .dat name is blocked" "$SCAN" tree "$T"
+T="$WORK/tree-v5-prefixgz"; mkdir -p "$T"; echo ok >"$T/main.py"
+{ printf 'header\n'; git -C "$R" archive --format=tar.gz HEAD; } >"$T/blob.bin"
+expect_msg 1 'archives' "tree: gzip after a text header is blocked" "$SCAN" tree "$T"
+
 echo; echo "$pass passed, $failn failed"
 exit $(( failn > 0 ? 1 : 0 ))

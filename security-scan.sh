@@ -18,11 +18,16 @@
 # How input is produced: the scanner runs git itself (text diffs; no renames, textconv or external diff;
 # history and output settings pinned; replace refs disabled; grafts refused), checks git's exit status,
 # and extracts added lines with a strict patch parser that fails on anything it cannot account for.
-# Secret scanning: the content is written as small pieces (under 26 KB, overlapping by 8 KB, each led by
-# a 1 KB text guard, named only by file-type class) and gitleaks scans that folder. Pieces are too small
-# for gitleaks to split, the guard stops binary file-type detection from skipping a piece, the names keep
-# path-gated rules (PHP, Terraform/HCL, YAML, nuget.config) working and cannot match path exclusions, and
-# the scan fails unless gitleaks reports exactly the number of bytes written.
+# Secret scanning (gitleaks never reads the repository; files are named only by file-type class, so
+# path-gated rules work and the default policy's path exclusions cannot match):
+#   1. each unit (a file, or the lines one commit adds to one file) is scanned as it is, so the scan finds
+#      at least what gitleaks alone finds in that unit;
+#   2. guarded windows close gitleaks' own blind spots: each starts with a 1 KB text guard so a unit that
+#      begins like a binary file is still scanned; units up to 98,000 bytes are scanned whole (full
+#      context), larger ones as 98,000-byte windows overlapping by 49,000, each under gitleaks' 100 KB
+#      buffer, so its chunk cut can never split a match of up to 49,000 bytes. The scan fails unless
+#      gitleaks reports exactly the bytes written for the windows (the only matcher that could still
+#      skip a window, ISO-9660 at byte 32,769, therefore causes an error, never a silent pass).
 #
 # Exit codes: 0 = clean, 1 = findings (blocked), 2 = scanner error (blocks; never reported as clean).
 # Environment (set by the caller, not by the scanned repository):
@@ -90,28 +95,38 @@ case "$MODE" in
 esac
 
 # ---- perl helpers -----------------------------------------------------------------------------------------
-# pieces(): writes one unit of content (a file, or the lines one commit adds to one file) as guarded,
-# overlapping pieces named by file-type class, and counts the bytes written.
+# pieces(): writes one unit of content (a file, or the lines one commit adds to one file) for two gitleaks
+# runs, named by file-type class:
+#   $TMP/whole   the unit as it is: exactly what gitleaks alone would scan for that unit
+#   $TMP/pieces  guarded windows whose every byte must be scanned (byte count checked): 98,000 bytes,
+#                overlapping by 49,000, so a unit up to 98,000 bytes is one window with full context and any
+#                span up to 49,000 bytes lies inside one window; with the guard a window stays under
+#                gitleaks' 100,000-byte buffer, so gitleaks never cuts it.
 PL_PIECES='
   use strict; use warnings;
   my $GUARD = ("#" x 1023) . "\n";
-  my ($PIECE, $STEP) = (24576, 16384);   # 8 KB overlap; guard + piece < 32773 (largest matcher offset)
   my ($n, $bytes) = (0, 0);
   sub cls { my $p = shift;
     return ".php" if $p =~ /\.php\z/i;  return ".tf" if $p =~ /\.(?:tf|hcl)\z/i;
     return ".yaml" if $p =~ /\.ya?ml\z/i; return ".nuget.config" if $p =~ /nuget\.config\z/i;
     return ".txt"; }
-  sub pieces { my ($dir, $data, $path) = @_;
-    my $len = length $data; return if $len == 0;
-    my $sfx = cls($path);
-    for (my $off = 0; ; $off += $STEP) {
-      my $chunk = substr($data, $off, $PIECE);
-      $n++; my $f = sprintf("%s/%07d%s", $dir, $n, $sfx);
-      open(my $fh, ">", $f) or die "open $f: $!\n"; binmode $fh;
-      print {$fh} $GUARD, $chunk or die "write $f: $!\n"; close $fh or die "close $f: $!\n";
+  sub wfile { my ($f, $guard, $data) = @_;
+    open(my $fh, ">", $f) or die "open $f: $!\n"; binmode $fh;
+    print {$fh} $guard, $data or die "write $f: $!\n"; close $fh or die "close $f: $!\n"; }
+  sub windows { my ($dir, $tag, $data, $sfx, $size, $step) = @_;
+    my $len = length $data;
+    for (my $off = 0; ; $off += $step) {
+      my $chunk = substr($data, $off, $size);
+      $n++; wfile(sprintf("%s/%s%07d%s", $dir, $tag, $n, $sfx), $GUARD, $chunk);
       $bytes += length($GUARD) + length($chunk);
-      last if $off + $PIECE >= $len;
+      last if $off + $size >= $len;
     } }
+  sub pieces { my ($dir, $data, $path) = @_;
+    return if length($data) == 0;
+    my $sfx = cls($path);
+    $n++; wfile(sprintf("%s/../whole/u%07d%s", $dir, $n, $sfx), "", $data);
+    windows($dir, "w", $data, $sfx, 98000, 49000);
+  }
   sub done { my $bf = shift; open(my $b, ">", $bf) or die "open: $!\n"; print {$b} "$bytes\n"; close $b or die "close: $!\n"; }
 '
 
@@ -164,15 +179,16 @@ read_tree() {
       close $fh or die "cannot read $rel: $!\n";
       pieces($dir, $data, $rel);
       print {$code} $data, "\n" unless $rel =~ /\.md\z/;
-      if ($data =~ /\A(?:PK\x03\x04|PK\x05\x06|PK\x07\x08|\x1f\x8b|BZh[1-9]|\xfd7zXZ\x00|7z\xbc\xaf\x27\x1c|Rar!\x1a\x07|\x28\xb5\x2f\xfd)/
-          || (length($data) > 262 && substr($data, 257, 5) eq "ustar")) { print {$arc} $rel, "\0"; }
+      # archive signatures anywhere in the file: archives can carry a prefix (self-extracting, padded)
+      if ($data =~ /PK\x03\x04|PK\x05\x06|PK\x07\x08|PK\x06\x06|Rar!\x1a\x07|7z\xbc\xaf\x27\x1c|\xfd7zXZ\x00|\x28\xb5\x2f\xfd|\x1f\x8b\x08|BZh[1-9]1AY&SY|MSCF\x00\x00\x00\x00|ustar(?:\x00|  \x00)/) {
+        print {$arc} $rel, "\0"; }
     }
     done($bytesf); close $code or die "close: $!\n"; close $arc or die "close: $!\n";
   ' "$DIR" "$TMP/pieces" "$TMP/added" "$TMP/bytes" "$TMP/arc_content" <"$TMP/files" 2>"$TMP/perl.err" || die "$(cat "$TMP/perl.err")"
 }
 
 # ---- 1. collect file names, added lines, and the pieces to scan for secrets -----------------------------
-mkdir "$TMP/pieces"; : >"$TMP/files"; : >"$TMP/added"; : >"$TMP/raw"
+mkdir "$TMP/pieces" "$TMP/whole"; : >"$TMP/files"; : >"$TMP/added"; : >"$TMP/raw"
 case "$MODE" in
   staged)
     "${G[@]}" diff --cached --name-only -z --no-renames --diff-filter=ACMRT >"$TMP/files"
@@ -198,24 +214,31 @@ case "$MODE" in
     ;;
 esac
 
-# ---- 2. secrets: gitleaks with a fixed policy over the pieces --------------------------------------------
+# ---- 2. secrets: gitleaks with a fixed policy, two runs ---------------------------------------------------
 # Built-in rules only; the scanned repository's .gitleaks.toml, .gitleaksignore and inline "gitleaks:allow"
 # comments are ignored. Findings use exit code 3 so they cannot be confused with errors.
+#   whole:  each unit as it is, so nothing gitleaks would find on its own is lost (no byte check: gitleaks
+#           may legitimately skip a unit that starts like a binary file, exactly as it would on its own)
+#   pieces: guarded windows; gitleaks must report exactly the bytes written
 printf '[extend]\nuseDefault = true\n' >"$TMP/gitleaks.toml"
 mkdir -p "$TMP/noignore"
-rc=0
-"$GITLEAKS" dir "$TMP/pieces" --config "$TMP/gitleaks.toml" --gitleaks-ignore-path "$TMP/noignore" --ignore-gitleaks-allow \
-  --max-archive-depth 0 --redact --no-banner --exit-code 3 --log-level info >"$TMP/gl.out" 2>&1 || rc=$?
-if [ $rc -eq 3 ]; then cat "$TMP/gl.out" >&2; block "secrets detected"
-elif [ $rc -ne 0 ]; then cat "$TMP/gl.out" >&2; die "gitleaks failed (exit $rc)"
-fi
-if grepq -aiE '(^|[[:space:]])(ERR|ERROR|FTL|FATAL)([[:space:]]|$)|level=(error|fatal)|(WRN|WARN).*(fail|error|unable|skip|could not|cannot)' "$TMP/gl.out"; then
-  cat "$TMP/gl.out" >&2; die "gitleaks reported errors: treating the scan as incomplete"
-fi
+gl_dir() {  # gl_dir <folder> <label>: runs gitleaks; findings -> block; errors -> exit 2; prints bytes scanned
+  local rc=0
+  "$GITLEAKS" dir "$1" --config "$TMP/gitleaks.toml" --gitleaks-ignore-path "$TMP/noignore" --ignore-gitleaks-allow \
+    --max-archive-depth 0 --redact --no-banner --exit-code 3 --log-level info >"$TMP/gl.$2" 2>&1 || rc=$?
+  if [ $rc -eq 3 ]; then cat "$TMP/gl.$2" >&2; block "secrets detected ($2 scan)"
+  elif [ $rc -ne 0 ]; then cat "$TMP/gl.$2" >&2; die "gitleaks failed ($2 scan, exit $rc)"
+  fi
+  if grepq -aiE '(^|[[:space:]])(ERR|ERROR|FTL|FATAL)([[:space:]]|$)|level=(error|fatal)|(WRN|WARN).*(fail|error|unable|could not|cannot)' "$TMP/gl.$2"; then
+    cat "$TMP/gl.$2" >&2; die "gitleaks reported errors ($2 scan): treating the scan as incomplete"
+  fi
+}
+gl_dir "$TMP/whole" whole
+gl_dir "$TMP/pieces" pieces
 want=$(cat "$TMP/bytes")
-got=$(perl -ne 'if (/scanned ~(\d+) bytes/) { print $1; $f = 1 } END { exit($f ? 0 : 1) }' "$TMP/gl.out") \
-  || { cat "$TMP/gl.out" >&2; die "gitleaks did not report how much it scanned"; }
-[ "$got" = "$want" ] || { cat "$TMP/gl.out" >&2; die "gitleaks scanned $got of $want bytes: incomplete scan"; }
+got=$(perl -ne 'if (/scanned ~(\d+) bytes/) { print $1; $f = 1 } END { exit($f ? 0 : 1) }' "$TMP/gl.pieces") \
+  || { cat "$TMP/gl.pieces" >&2; die "gitleaks did not report how much it scanned"; }
+[ "$got" = "$want" ] || { cat "$TMP/gl.pieces" >&2; die "gitleaks scanned $got of $want bytes: incomplete scan"; }
 
 # helper: run a regex test on every file name, NUL-safe (names may contain spaces, newlines, Japanese)
 names_matching() {  # names_matching <ERE> <outfile>: case-insensitive, in-process (no pipeline to hide errors)
