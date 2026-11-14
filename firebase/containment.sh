@@ -17,9 +17,19 @@ python3 - "${TMPDIR:-/tmp}/containment-policy.$$" <<'PY' || rc=$?
 import json, sys
 try:
     p = json.load(open(sys.argv[1]))
-    if not isinstance(p, dict) or not isinstance(p.get("bindings", []), list):
+    if not isinstance(p, dict) or not p or not set(p) <= {"bindings", "etag", "version", "auditConfigs"}:
         raise ValueError("not an IAM policy")
-    members = [m for b in p.get("bindings", []) for m in b["members"]]
+    if "etag" not in p:
+        raise ValueError("IAM policy without etag")
+    bindings = p.get("bindings", [])
+    if not isinstance(bindings, list):
+        raise ValueError("bindings is not a list")
+    members = []
+    for b in bindings:
+        if not isinstance(b, dict) or not isinstance(b.get("role"), str) or not isinstance(b.get("members"), list) \
+                or not all(isinstance(m, str) for m in b["members"]):
+            raise ValueError("malformed binding")
+        members += b["members"]
 except Exception as e:
     print(f"containment: could not parse the IAM policy: {e}", file=sys.stderr); sys.exit(2)
 sys.exit(1 if any(m in ("all" "Users", "all" "AuthenticatedUsers") for m in members) else 0)

@@ -107,8 +107,8 @@ case "$*" in
 esac
 SH
 printf '#!/bin/sh\nprintf %%s "$FAKE_CODE"\n' >"$FB/curl"; chmod +x "$FB/gcloud" "$FB/curl"
-printf '{"bindings":[{"role":"roles/run.invoker","members":["serviceAccount:site@p.iam.gserviceaccount.com"]}]}' >"$WORK/private.json"
-perl -e 'print q({"bindings":[{"role":"roles/run.invoker","members":["all) . q(Users"]}]})' >"$WORK/public.json"
+printf '{"etag":"BwX","bindings":[{"role":"roles/run.invoker","members":["serviceAccount:site@p.iam.gserviceaccount.com"]}]}' >"$WORK/private.json"
+perl -e 'print q({"etag":"BwX","bindings":[{"role":"roles/run.invoker","members":["all) . q(Users"]}]})' >"$WORK/public.json"
 run_c() { env PATH="$FB:$PATH" FAKE_SVC="$1" FAKE_POLICY="$2" FAKE_CODE="$3" bash "$HERE/containment.sh" fn asia-northeast1 proj /x; }
 expect 0 "containment: private service, anonymous 403" run_c projects/p/locations/r/services/fn "$WORK/private.json" 403
 expect 1 "containment: public invoker fails" run_c projects/p/locations/r/services/fn "$WORK/public.json" 403
@@ -116,6 +116,10 @@ expect 1 "containment: anonymous 200 fails" run_c projects/p/locations/r/service
 printf 'not json' >"$WORK/bad.json"; printf '{"bindings": "x"}' >"$WORK/bad2.json"; printf '{"etag": "BwX"}' >"$WORK/empty.json"
 expect 1 "containment: malformed policy fails" run_c projects/p/locations/r/services/fn "$WORK/bad.json" 403
 expect 1 "containment: non-policy JSON fails" run_c projects/p/locations/r/services/fn "$WORK/bad2.json" 403
+printf '{"error":"denied"}' >"$WORK/err.json"
+perl -e 'print q({"etag":"x","bindings":[{"role":"roles/run.invoker","members":"all) . q(Users"}]})' >"$WORK/strmem.json"
+expect 1 "containment: error-shaped output fails" run_c projects/p/locations/r/services/fn "$WORK/err.json" 403
+expect 1 "containment: members as a string (not a list) fails" run_c projects/p/locations/r/services/fn "$WORK/strmem.json" 403
 expect 0 "containment: policy with no bindings (no invokers) passes" run_c projects/p/locations/r/services/fn "$WORK/empty.json" 403
 expect 1 "containment: unreadable function fails" run_c "" "$WORK/private.json" 403
 
