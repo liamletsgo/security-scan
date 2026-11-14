@@ -7,9 +7,12 @@
 set -Eeuo pipefail
 trap 'echo "TEST SETUP FAILED at line $LINENO" >&2; exit 2' ERR
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-SCAN="$HERE/security-scan.sh"
 pass=0; failn=0
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/scan-tests.XXXXXX"); trap 'rm -rf "$WORK"' EXIT
+# run the scanner with the same bash that runs this suite (CI uses macOS /bin/bash 3.2), not the shebang's
+SCAN="$WORK/scan"
+printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$BASH" "$HERE/security-scan.sh" >"$SCAN"; chmod +x "$SCAN"
+echo "scanner shell: $BASH ($BASH_VERSION)"
 
 expect() {  # expect <code> <label> <command...>
   local want=$1 label=$2 got=0; shift 2
@@ -25,7 +28,8 @@ newrepo() {
 commit() {  # commit <repo> <message>: snapshot the index as a new commit on HEAD, no hooks
   local d=$1 msg=$2 tree parent c
   tree=$(git -C "$d" write-tree)
-  if parent=$(git -C "$d" rev-parse -q --verify HEAD); then c=$(git -C "$d" commit-tree "$tree" -p "$parent" -m "$msg")
+  parent=$(git -C "$d" rev-parse -q --verify HEAD 2>/dev/null || true)
+  if [ -n "$parent" ]; then c=$(git -C "$d" commit-tree "$tree" -p "$parent" -m "$msg")
   else c=$(git -C "$d" commit-tree "$tree" -m "$msg"); fi
   git -C "$d" update-ref HEAD "$c"
 }
@@ -239,6 +243,140 @@ expect 1 "tree: archive in a deploy payload is blocked" "$SCAN" tree "$T"
 # must run from the repository root
 mkdir -p "$R/sub"
 expect 2 "error: run from a subdirectory" bash -c "cd '$R/sub' && '$SCAN' range $BASE HEAD"
+
+# ---------------- v4 regression tests (Codex review of v3) ----------------
+# expect_msg: exit code AND the expected diagnostic, so an unrelated finding cannot hide a missed one
+expect_msg() {  # expect_msg <code> <ERE> <label> <command...>
+  local want=$1 re=$2 label=$3 got=0; shift 3
+  "$@" >"$WORK/msg.out" 2>&1 || got=$?
+  if [ "$got" -eq "$want" ] && grep -qE -- "$re" "$WORK/msg.out"; then pass=$((pass+1)); echo "PASS  $label"
+  else failn=$((failn+1)); echo "FAIL  $label (got $got, want $want /$re/): $(tr '\n' ' ' <"$WORK/msg.out" | cut -c1-200)"; fi
+}
+SECRET='secrets detected'
+rangerepo() {  # rangerepo <name>: new repo with one base commit; prints the repo path
+  local d; d=$(newrepo "$1"); put "$d" README.txt base; commit "$d" init; echo "$d"
+}
+filler() { perl -e 'print "x" x $ARGV[0]' "$1"; }
+
+# P1-1: binary file-type signatures do not stop the secret scan (same file and a later file)
+D=$(rangerepo v4-pdf); B=$(git -C "$D" rev-parse HEAD)
+printf '%%PDF-1.4\ntoken = "%s"\n' "$TOKEN" >"$D/a.txt"; git -C "$D" add a.txt; commit "$D" pdf
+expect_msg 1 "$SECRET" "range: PDF signature then a token in the same file" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(rangerepo v4-pdf2); B=$(git -C "$D" rev-parse HEAD)
+printf '%%PDF-1.4\nnothing here\n' >"$D/a.txt"; printf 'token = "%s"\n' "$TOKEN" >"$D/b.txt"; git -C "$D" add a.txt b.txt; commit "$D" pdf2
+expect_msg 1 "$SECRET" "range: PDF signature file followed by a token in a later file" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(rangerepo v4-tar); B=$(git -C "$D" rev-parse HEAD)
+{ filler 257; printf 'ustar\ntoken = "%s"\n' "$TOKEN"; } >"$D/t.txt"; git -C "$D" add t.txt; commit "$D" tar
+expect_msg 1 "$SECRET" "range: tar signature at offset 257 then a token" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+T="$WORK/tree-v4-pdf"; mkdir -p "$T"; printf '%%PDF-1.4\ntoken = "%s"\n' "$TOKEN" >"$T/a.txt"
+expect_msg 1 "$SECRET" "tree: PDF signature then a token" "$SCAN" tree "$T"
+D=$(newrepo v4-pdf-staged); put "$D" README.txt base; commit "$D" init
+printf '%%PDF-1.4\ntoken = "%s"\n' "$TOKEN" >"$D/a.txt"; git -C "$D" add a.txt
+expect_msg 1 "$SECRET" "staged: PDF signature then a token" bash -c "cd '$D' && '$SCAN' staged"
+
+# P1-2: a token across gitleaks' 100 KB buffer and across the scanner's own piece boundaries
+# gitleaks cuts a long line at byte 125,000 (100 KB buffer + 25 KB peek): 124980 straddles it for raw
+# input, 123956 straddles it after the 1 KB guard; 24570 and 40950 straddle the scanner's own pieces.
+for off in 124980 123956 24570 40950; do
+  D=$(rangerepo "v4-long-$off"); B=$(git -C "$D" rev-parse HEAD)
+  { filler "$off"; printf '%s' "$TOKEN"; filler 60000; printf '\n'; } >"$D/min.js"; git -C "$D" add min.js; commit "$D" long
+  expect_msg 1 "$SECRET" "range: token at byte $off of a long minified line" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+  T="$WORK/tree-v4-long-$off"; mkdir -p "$T"; cp "$D/min.js" "$T/min.js"
+  expect_msg 1 "$SECRET" "tree: token at byte $off of a long minified line" "$SCAN" tree "$T"
+done
+D=$(newrepo v4-long-staged); put "$D" README.txt base; commit "$D" init
+{ filler 124980; printf '%s' "$TOKEN"; filler 60000; printf '\n'; } >"$D/min.js"; git -C "$D" add min.js
+expect_msg 1 "$SECRET" "staged: token across gitleaks' 125 KB cut" bash -c "cd '$D' && '$SCAN' staged"
+
+# P1-3: path-gated gitleaks rules still apply (Terraform, Kubernetes Secret YAML, nuget.config)
+TF='resource "x" "y" {
+  password = "Kq7vRt2mZp"
+}'
+K8='apiVersion: v1
+kind: Secret
+metadata:
+  name: app
+data:
+  dbpass: cGFzc3dvcmQxMjM0NTY3OA=='
+NU='<configuration><packageSourceCredentials><feed><add key="ClearTextPassword" value="Zx9vQ2mLp4Rt" /></feed></packageSourceCredentials></configuration>'
+for spec in "infra/main.tf|$TF" "k8s/secret.yml|$K8" "NuGet.Config|$NU"; do
+  p=${spec%%|*}; body=${spec#*|}
+  D=$(rangerepo "v4-gated-$(slug "$p")"); B=$(git -C "$D" rev-parse HEAD)
+  put "$D" "$p" "$body"; commit "$D" gated
+  expect_msg 1 "$SECRET" "range: path-gated rule fires for $p" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+  T="$WORK/tree-v4-gated-$(slug "$p")"; mkdir -p "$(dirname "$T/$p")"; printf '%s\n' "$body" >"$T/$p"
+  expect_msg 1 "$SECRET" "tree: path-gated rule fires for $p" "$SCAN" tree "$T"
+done
+
+# P1-4: history semantics are pinned (merge config, root commits, replace refs, grafts)
+D=$(newrepo v4-merge-removed); put "$D" a.txt one; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" a.txt left; commit "$D" left; L=$(git -C "$D" rev-parse HEAD)
+git -C "$D" update-ref HEAD "$B"; git -C "$D" read-tree "$B"; put "$D" a.txt right; commit "$D" right; RR=$(git -C "$D" rev-parse HEAD)
+put "$D" a.txt resolved; put "$D" config.txt "token = \"$TOKEN\""
+T=$(git -C "$D" write-tree); M=$(git -C "$D" commit-tree "$T" -p "$L" -p "$RR" -m merge); git -C "$D" update-ref HEAD "$M"
+git -C "$D" rm -q --cached config.txt; rm -f "$D/config.txt"; commit "$D" "remove again"
+git -C "$D" config log.diffMerges off; git -C "$D" config log.showRoot false; git -C "$D" config diff.renames copies
+expect_msg 1 "$SECRET" "history: merge-only secret later removed, with log.diffMerges=off" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(newrepo v4-unrelated); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+git -C "$D" rm -q --cached README.txt; put "$D" other.txt "token = \"$TOKEN\""
+T=$(git -C "$D" write-tree); ROOT2=$(git -C "$D" commit-tree "$T" -m "unrelated root")
+git -C "$D" read-tree "$B"
+T=$(git -C "$D" write-tree); M=$(git -C "$D" commit-tree "$T" -p "$B" -p "$ROOT2" -m "merge unrelated, drop its file"); git -C "$D" update-ref HEAD "$M"
+git -C "$D" config log.showRoot false
+expect_msg 1 "$SECRET" "history: secret in an unrelated root merged then dropped, log.showRoot=false" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(rangerepo v4-replace); B=$(git -C "$D" rev-parse HEAD)
+put "$D" config.txt "token = \"$TOKEN\""; commit "$D" bad; BAD=$(git -C "$D" rev-parse HEAD)
+put "$D" config.txt "x = 1"; T=$(git -C "$D" write-tree); CLEAN=$(git -C "$D" commit-tree "$T" -p "$B" -m clean)
+git -C "$D" replace "$BAD" "$CLEAN"
+expect_msg 1 "$SECRET" "history: replace refs cannot hide a commit" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(rangerepo v4-grafts); B=$(git -C "$D" rev-parse HEAD); put "$D" x.txt 1; commit "$D" two
+mkdir -p "$D/.git/info"; git -C "$D" rev-parse HEAD >"$D/.git/info/grafts"
+expect_msg 2 'grafted' "history: grafted repositories are refused" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# P1-5: git metadata inside a deploy payload is blocked, not skipped
+T="$WORK/tree-v4-gitdir"; mkdir -p "$T/.git"; echo ok >"$T/main.py"; printf '[remote "origin"]\n\turl = x\n' >"$T/.git/config"
+expect_msg 1 'git metadata' "tree: .git inside a deploy payload is blocked" "$SCAN" tree "$T"
+
+# P2: metadata failures are errors, not "absent"; repository identity; dependency failures
+mkdir -p "$FAKE/git-lstree-fails"
+printf '#!/bin/sh\ncase " $* " in *" ls-tree "*) exit 128 ;; esac\nexec "%s" "$@"\n' "$REALGIT" >"$FAKE/git-lstree-fails/git"; chmod +x "$FAKE/git-lstree-fails/git"
+D=$(rangerepo v4-envmeta); B=$(git -C "$D" rev-parse HEAD); put "$D" .env 'STORAGE_BUCKET=x'; commit "$D" env
+expect_msg 2 'ERROR' "env: failing tree lookup is an error, not a deleted file" bash -c "cd '$D' && PATH='$FAKE/git-lstree-fails':\$PATH '$SCAN' range $B HEAD"
+expect_msg 2 'root of the repository' "identity: GIT_WORK_TREE pointing elsewhere is refused" bash -c "cd '$R' && GIT_WORK_TREE='$WORK' '$SCAN' range $BASE HEAD"
+mkdir -p "$FAKE/perl-fails"; printf '#!/bin/sh\nexit 1\n' >"$FAKE/perl-fails/perl"; chmod +x "$FAKE/perl-fails/perl"
+expect_msg 2 'ERROR' "perl failing is an error" bash -c "cd '$R' && PATH='$FAKE/perl-fails':\$PATH '$SCAN' range $BASE HEAD"
+printf '#!/bin/sh\necho "1:00PM INF scanned ~1 bytes (1 bytes) in 1ms"\nexit 0\n' >"$FAKE/gitleaks-short"; chmod +x "$FAKE/gitleaks-short"
+expect_msg 2 'incomplete scan' "gitleaks scanning fewer bytes than written is an error" bash -c "cd '$R' && GITLEAKS='$FAKE/gitleaks-short' '$SCAN' range $BASE HEAD"
+printf '#!/bin/sh\nexit 0\n' >"$FAKE/gitleaks-silent"; chmod +x "$FAKE/gitleaks-silent"
+expect_msg 2 'did not report' "gitleaks reporting nothing is an error" bash -c "cd '$R' && GITLEAKS='$FAKE/gitleaks-silent' '$SCAN' range $BASE HEAD"
+if [ "$(id -u)" != 0 ]; then
+  T="$WORK/tree-v4-unreadable-dir"; mkdir -p "$T/locked"; echo x >"$T/locked/a.py"; echo ok >"$T/b.py"; chmod 000 "$T/locked"
+  expect 2 "tree: unreadable subdirectory is an error" "$SCAN" tree "$T"
+  chmod 700 "$T/locked"
+fi
+
+# submodules, renames, archives by content
+D=$(rangerepo v4-gitlink); B=$(git -C "$D" rev-parse HEAD)
+git -C "$D" update-index --add --cacheinfo "160000,$B,vendor/lib"; commit "$D" sub
+expect_msg 1 'submodules' "range: a submodule (gitlink) is blocked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(newrepo v4-rename); put "$D" RULES.md 'Never call blob.make_public() in code.'; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+git -C "$D" mv RULES.md storage.py; commit "$D" rename
+expect_msg 1 'public storage objects' "range: content renamed from .md into code is checked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+T="$WORK/tree-v4-zipdata"; mkdir -p "$T"; echo ok >"$T/main.py"; printf 'PK\003\004rest' >"$T/notes.dat"
+expect_msg 1 'archives' "tree: archive detected by content despite its name" "$SCAN" tree "$T"
+
+# parser edge cases: CRLF, no final newline, odd names, markdown classification
+D=$(rangerepo v4-crlf); B=$(git -C "$D" rev-parse HEAD)
+printf 'a = 1\r\nblob.make_public()\r\n' >"$D/w.py"; git -C "$D" add w.py; commit "$D" crlf
+expect_msg 1 'public storage objects' "parser: CRLF line is checked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(rangerepo v4-nonl); B=$(git -C "$D" rev-parse HEAD); printf 'x = "allUsers"' >"$D/nonl.py"; git -C "$D" add nonl.py; commit "$D" nonl
+expect_msg 1 'public storage objects' "parser: last line without a newline is checked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(rangerepo v4-mdname); B=$(git -C "$D" rev-parse HEAD)
+printf 'blob.make_public()\n' >"$D/my notes.md"; printf 'x = 1\n' >"$D/q\"uote.py"; git -C "$D" add "my notes.md" "q\"uote.py"; commit "$D" md
+expect 0 "parser: quoted/space names parse; markdown with a space in its name is docs" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(rangerepo v4-quoted-code); B=$(git -C "$D" rev-parse HEAD)
+printf 'blob.make_public()\n' >"$D/q\"uote.py"; git -C "$D" add "q\"uote.py"; commit "$D" q
+expect_msg 1 'public storage objects' "parser: code file with a quote in its name is checked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
 
 echo; echo "$pass passed, $failn failed"
 exit $(( failn > 0 ? 1 : 0 ))

@@ -17,10 +17,12 @@ jobs:
         include:
           - label: linux
             os: ubuntu-latest
+            shell: bash
             asset: gitleaks_8.30.1_linux_x64.tar.gz
             sha256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
           - label: macos
             os: macos-latest
+            shell: /bin/bash
             asset: gitleaks_8.30.1_darwin_arm64.tar.gz
             sha256: b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
     runs-on: ${{ matrix.os }}
@@ -41,9 +43,13 @@ jobs:
           tar -xzf "$ASSET" gitleaks
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Run tests
+        env:
+          TEST_SHELL: ${{ matrix.shell }}
         run: |
           git config --global user.email ci@example.invalid
           git config --global user.name ci
           gitleaks version
           perl -v | head -2
-          bash tests/run-tests.sh
+          git --version
+          "$TEST_SHELL" --version | head -1
+          "$TEST_SHELL" tests/run-tests.sh
