@@ -76,5 +76,24 @@ expect 2 "manifest: parameters refused" node "$HERE/manifest-check.js" "$FT" "$W
 printf 'extra: 1\n' >>"$WORK/changed.yaml"; cp "$WORK/changed.yaml" "$WORK/extra.yaml"
 expect 2 "manifest: unknown top-level key refused" node "$HERE/manifest-check.js" "$FT" "$WORK/extra.yaml" "$WORK/extra.yaml"
 
+# containment check, with stand-in gcloud and curl
+FB="$WORK/fakebin"; mkdir -p "$FB"
+cat >"$FB/gcloud" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"functions describe"*serviceConfig.service*) [ -n "$FAKE_SVC" ] && echo "$FAKE_SVC" ;;
+  *"functions describe"*serviceConfig.uri*) echo "https://fn.example.invalid" ;;
+  *"get-iam-policy"*) cat "$FAKE_POLICY" ;;
+esac
+SH
+printf '#!/bin/sh\nprintf %%s "$FAKE_CODE"\n' >"$FB/curl"; chmod +x "$FB/gcloud" "$FB/curl"
+printf '{"bindings":[{"role":"roles/run.invoker","members":["serviceAccount:site@p.iam.gserviceaccount.com"]}]}' >"$WORK/private.json"
+perl -e 'print q({"bindings":[{"role":"roles/run.invoker","members":["all) . q(Users"]}]})' >"$WORK/public.json"
+run_c() { env PATH="$FB:$PATH" FAKE_SVC="$1" FAKE_POLICY="$2" FAKE_CODE="$3" bash "$HERE/containment.sh" fn asia-northeast1 proj /x; }
+expect 0 "containment: private service, anonymous 403" run_c projects/p/locations/r/services/fn "$WORK/private.json" 403
+expect 1 "containment: public invoker fails" run_c projects/p/locations/r/services/fn "$WORK/public.json" 403
+expect 1 "containment: anonymous 200 fails" run_c projects/p/locations/r/services/fn "$WORK/private.json" 200
+expect 1 "containment: unreadable function fails" run_c "" "$WORK/private.json" 403
+
 echo; echo "$pass passed, $failn failed"
 exit $(( failn > 0 ? 1 : 0 ))

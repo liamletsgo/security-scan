@@ -142,6 +142,8 @@ and verified by SHA-256 each:
   Firebase would upload outside the scanned payload) and equals the reviewed copy in the repository. With
   `functions.yaml` in the source folder, firebase-tools reads it instead of running the app, so the credentialed
   deploy step never executes application code.
+- `containment.sh` runs after a deploy: it fails unless the function's Cloud Run service has no public invoker
+  and an anonymous request is refused (401/403).
 - `package.json` / `package-lock.json` pin firebase-tools 15.18.0 and its whole dependency tree with integrity
   hashes; install with `npm ci --ignore-scripts`.
 
