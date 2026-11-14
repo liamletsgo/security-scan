@@ -415,5 +415,29 @@ T="$WORK/tree-v5-prefixgz"; mkdir -p "$T"; echo ok >"$T/main.py"
 { printf 'header\n'; git -C "$R" archive --format=tar.gz HEAD; } >"$T/blob.bin"
 expect_msg 1 'archives' "tree: gzip after a text header is blocked" "$SCAN" tree "$T"
 
+# ---------------- v6 regression tests (Codex final review) ----------------
+# a pre-POSIX tar (no "ustar"), space-padded so it has no NUL bytes, named innocently: caught by its header checksum
+legacy_tar() { perl -e '
+  my $data = "a,b\n1,2\n"; my $f = sub { my ($v, $w) = @_; substr($v . (" " x $w), 0, $w) };
+  my $h = $f->("clients.csv", 100) . $f->("0000644", 8) . $f->("0000000", 8) . $f->("0000000", 8)
+        . $f->(sprintf("%011o", length $data), 12) . $f->("14000000000", 12) . (" " x 8) . "0" . (" " x 355);
+  my $sum = unpack("%32C*", $h); substr($h, 148, 8) = sprintf("%06o ", $sum) . " ";
+  print $h, $f->($data, 512);'; }
+T="$WORK/tree-v6-legacytar"; mkdir -p "$T"; echo ok >"$T/main.py"; legacy_tar >"$T/payload.dat"
+expect_msg 1 'archives' "tree: legacy tar without ustar or NUL bytes, innocently named, is blocked" "$SCAN" tree "$T"
+T="$WORK/tree-v6-binary"; mkdir -p "$T"; echo ok >"$T/main.py"; printf 'abc\000def\n' >"$T/data.bin"
+expect_msg 1 'binary files' "tree: a binary file (NUL bytes) in a deploy payload is blocked" "$SCAN" tree "$T"
+# risky patterns in other valid spellings, including across lines
+for spec in "rules1|firestore.rules|allow get, list: if true;" \
+            "rules2|firestore.rules|allow create, update, delete: if true;" \
+            "rules3|storage.rules|allow read, write: if
+  true;" \
+            "keyspace|app.py|cred = credentials.Certificate (\"key.json\")" \
+            "infospace|app.py|c = service_account.Credentials.from_service_account_info (d)"; do
+  name=${spec%%|*}; rest=${spec#*|}; file=${rest%%|*}; body=${rest#*|}
+  D=$(rangerepo "v6-$name"); B=$(git -C "$D" rev-parse HEAD); put "$D" "$file" "$body"; commit "$D" risky
+  expect 1 "range: risky pattern variant $name" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+done
+
 echo; echo "$pass passed, $failn failed"
 exit $(( failn > 0 ? 1 : 0 ))

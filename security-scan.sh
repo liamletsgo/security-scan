@@ -167,7 +167,8 @@ parse_patch() {
 # read_tree : every regular file in $DIR -> pieces, $TMP/added (except *.md), archive detection by content.
 read_tree() {
   perl -e "$PL_PIECES"'
-    my ($root, $dir, $codef, $bytesf, $arcf) = @ARGV;
+    my ($root, $dir, $codef, $bytesf, $arcf, $binf) = @ARGV;
+    open(my $bin, ">", $binf) or die "open: $!\n"; binmode $bin;
     open(my $code, ">", $codef) or die "open: $!\n"; binmode $code;
     open(my $arc, ">", $arcf) or die "open: $!\n"; binmode $arc;
     local $/ = "\0";
@@ -182,9 +183,22 @@ read_tree() {
       # archive signatures anywhere in the file: archives can carry a prefix (self-extracting, padded)
       if ($data =~ /PK\x03\x04|PK\x05\x06|PK\x07\x08|PK\x06\x06|Rar!\x1a\x07|7z\xbc\xaf\x27\x1c|\xfd7zXZ\x00|\x28\xb5\x2f\xfd|\x1f\x8b\x08|BZh[1-9]1AY&SY|MSCF\x00\x00\x00\x00|ustar(?:\x00|  \x00)/) {
         print {$arc} $rel, "\0"; }
+      elsif (tar_header($data)) { print {$arc} $rel, "\0"; }
+      # a deploy payload is code and configuration: any file with NUL bytes is binary and blocked
+      print {$bin} $rel, "\0" if index($data, "\0") >= 0;
     }
-    done($bytesf); close $code or die "close: $!\n"; close $arc or die "close: $!\n";
-  ' "$DIR" "$TMP/pieces" "$TMP/added" "$TMP/bytes" "$TMP/arc_content" <"$TMP/files" 2>"$TMP/perl.err" || die "$(cat "$TMP/perl.err")"
+    done($bytesf); close $code or die "close: $!\n"; close $arc or die "close: $!\n"; close $bin or die "close: $!\n";
+    # tar header (any variant, including pre-POSIX without "ustar"): its checksum field matches the header
+    sub tar_header { my $d = shift;
+      for (my $p = 0; $p + 512 <= length($d); $p += 512) {
+        my $h = substr($d, $p, 512);
+        next unless substr($h, 148, 8) =~ /\A[ \x00]*([0-7]{1,8})[ \x00]*\z/;
+        my $want = oct($1); next if $want < 256;
+        my $sum = unpack("%32C*", substr($h, 0, 148) . (" " x 8) . substr($h, 156));
+        return 1 if $sum == $want;
+      }
+      return 0; }
+  ' "$DIR" "$TMP/pieces" "$TMP/added" "$TMP/bytes" "$TMP/arc_content" "$TMP/binary" <"$TMP/files" 2>"$TMP/perl.err" || die "$(cat "$TMP/perl.err")"
 }
 
 # ---- 1. collect file names, added lines, and the pieces to scan for secrets -----------------------------
@@ -299,18 +313,24 @@ if [ "$MODE" = tree ]; then
   names_matching '\.(zip|tar|tgz|gz|bz2|xz|zst|7z|rar|jar|war|whl|egg|gem|apk|docx|pptx|odt|ods|epub)$' "$TMP/archives"
   cat "$TMP/arc_content" >>"$TMP/archives"
   if [ -s "$TMP/archives" ]; then block "archives are not allowed in a deploy payload (their contents are not scanned):"; show_names "$TMP/archives"; fi
+  if [ -s "$TMP/binary" ]; then block "binary files (NUL bytes) are not allowed in a deploy payload:"; show_names "$TMP/binary"; fi
 fi
 
-# ---- 6. risky code patterns in added lines -------------------------------------------------------------
-check() { if grepq -aE -- "$2" "$TMP/added"; then block "$1"; fi; }
-check "private key material"                                  'BEGIN (RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY'
+# ---- 6. risky code patterns in added content (whole text: matches may span lines) --------------------
+check() {  # check <label> <perl regex>
+  local rc=0
+  perl -0777 -ne 'BEGIN { $re = shift @ARGV } exit(/$re/ ? 0 : 1)' "$2" "$TMP/added" 2>"$TMP/perl.err" || rc=$?
+  [ $rc -le 1 ] || die "pattern check failed: $(cat "$TMP/perl.err")"
+  if [ $rc -eq 0 ]; then block "$1"; fi
+}
+check "private key material"                                  'BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED |DSA )?PRIVATE KEY'
 check "Microsoft Entra client secret"                         '[A-Za-z0-9_.~-]{3}[0-9]Q~[A-Za-z0-9_.~-]{30,}'
-check "public storage objects (make_public / allUsers)"       'make_public\(|allUsers|allAuthenticatedUsers'
-check "open Firebase rules (if true)"                         'allow[^;]*(read|write)[^;]*:[[:space:]]*if[[:space:]]+true'
-check "secret exposed to the browser via NEXT_PUBLIC_"        'NEXT_PUBLIC_[A-Z0-9_]*(PRIVATE|SECRET|PASSWORD|CLIENT_EMAIL)'
-check "service-account key loading (use workload identity)"   'credentials\.Certificate\(|from_service_account_file\(|from_service_account_info\(|GOOGLE_APPLICATION_CREDENTIALS[[:space:]]*='
-check "personal deploy token (use keyless federation)"        'firebase[[:space:]]+login:ci|--token[[:space:]]+"?\$\{?\{?[[:space:]]*(secrets\.)?FIREBASE_TOKEN'
-check "install-script hook added (review supply-chain risk)"  '"(pre|post)install"[[:space:]]*:'
+check "public storage objects (make_public / allUsers)"       'make_public\s*\(|allUsers|allAuthenticatedUsers'
+check "open Firebase rules (if true)"                         '\ballow\b[^;{}]*?:\s*if\s*\(?\s*true\b'
+check "secret exposed to the browser via NEXT_PUBLIC_"        'NEXT_PUBLIC_[A-Z0-9_]*(?:PRIVATE|SECRET|PASSWORD|CLIENT_EMAIL)'
+check "service-account key loading (use workload identity)"   'credentials\s*\.\s*Certificate\s*\(|from_service_account_(?:file|info)\s*\(|GOOGLE_APPLICATION_CREDENTIALS\s*='
+check "personal deploy token (use keyless federation)"        'firebase\s+login:ci|--token\s+"?\$\{?\{?\s*(?:secrets\.)?FIREBASE_TOKEN'
+check "install-script hook added (review supply-chain risk)"  '"(?:pre|post)install"\s*:'
 
 if [ $fail -ne 0 ]; then
   echo "${RED}[security] Stopped by security checks.${NC} Fix the items above; do not bypass the scan." >&2

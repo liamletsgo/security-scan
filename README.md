@@ -71,14 +71,22 @@ gitleaks; it cannot prove that every rule would match. Limits that remain:
 Any gitleaks error, warning about failures, non-zero exit other than the findings code, or death by signal
 exits 2.
 
-## Archives
+## Archives and binary files
 
 Archives are not unpacked. `tree` mode blocks them by name (`.zip`, `.tar`, `.gz`, `.7z`, `.jar`, `.whl`,
 `.gem`, `.docx`, `.pptx`, ...) and by content: a zip, gzip, bzip2, xz, 7z, rar, zstd, cab or tar signature
-*anywhere* in a file blocks it, so a prefixed or self-extracting archive with an innocent name is caught too
-(at the cost of an occasional false block on binary files, which are not expected in a deploy payload). In
-`staged`/`range` mode an archive's bytes are scanned as text, which does not reach compressed content;
-spreadsheets are blocked by the data-file check.
+*anywhere* in a file, or any 512-byte block whose tar header checksum is valid (pre-POSIX tar has no signature).
+A deploy payload is code and configuration, so `tree` mode also blocks any file containing a NUL byte: binary
+files are opaque to the text checks. In `staged`/`range` mode an archive's bytes are scanned as text, which does
+not reach compressed content; spreadsheets are blocked by the data-file check.
+
+## Risky-pattern checks
+
+The risky-pattern checks run over the whole added text (or, in `tree` mode, the files), so a statement split
+across lines is still matched, and common spacing variants are covered (`credentials.Certificate (...)`,
+`allow get, list: if true`). They are tripwires for known dangerous constructs, not a parser: unusual
+constructions (string concatenation, indirection) can avoid them, and file-name checks cannot prove that an
+arbitrary text file holds no client data.
 
 ## Range semantics
 
@@ -118,6 +126,27 @@ it. Run the scanner from a clean, known environment (in CI: a fresh runner).
   explicit reviewed baseline); `workflow_dispatch` → an explicit reviewed baseline such as the last deployed
   commit. Also run `tree` over the exact, fully assembled payload you deploy, before cloud credentials exist.
 - Scan in a job without secrets for pull requests from forks.
+
+## Firebase deploy helpers (`firebase/`)
+
+Used by keyless Firebase Functions (Python) deploy workflows, downloaded at the same pinned commit as the scanner
+and verified by SHA-256 each:
+
+- `payload.js` copies the exact files `firebase deploy --only functions` uploads, using the installed
+  firebase-tools' own lister and ignore list. It requires the pinned CLI version, refuses `predeploy`/`prebuild`
+  hooks and `additionalSources`, and fails if `.git`, `venv` or `node_modules` would be uploaded.
+- `discover.sh` produces the functions manifest (`functions.yaml`) the way firebase-tools does, by running the
+  app's Python SDK server. Run it only where no cloud credentials exist, on a throwaway copy.
+- `manifest-check.js` accepts a manifest only if it fits a strict profile (gcfv2 HTTPS endpoints only; no public
+  invoker, secrets, service-account override, parameters, extra APIs or Data Connect triggers, whose schema files
+  Firebase would upload outside the scanned payload) and equals the reviewed copy in the repository. With
+  `functions.yaml` in the source folder, firebase-tools reads it instead of running the app, so the credentialed
+  deploy step never executes application code.
+- `package.json` / `package-lock.json` pin firebase-tools 15.18.0 and its whole dependency tree with integrity
+  hashes; install with `npm ci --ignore-scripts`.
+
+`firebase/test.sh` checks the lister against firebase-tools' own packaging on a fixture project and exercises the
+manifest profile (CI job "firebase helpers").
 
 ## Tests
 
