@@ -439,5 +439,21 @@ for spec in "rules1|firestore.rules|allow get, list: if true;" \
   expect 1 "range: risky pattern variant $name" bash -c "cd '$D' && '$SCAN' range $B HEAD"
 done
 
+# merges that touch .env files (range mode lists each .env version; a merge's diff must not be read as commit ids)
+envmerge() {  # envmerge <name> <merge .env content>: two branches both edit .env, merged with the given resolution
+  local d; d=$(newrepo "$1"); put "$d" .env 'STORAGE_BUCKET=base'; commit "$d" init; local EB; EB=$(git -C "$d" rev-parse HEAD)
+  put "$d" .env 'STORAGE_BUCKET=left'; commit "$d" left; local l; l=$(git -C "$d" rev-parse HEAD)
+  git -C "$d" update-ref HEAD "$EB"; git -C "$d" read-tree "$EB"; put "$d" .env 'STORAGE_BUCKET=right'; commit "$d" right
+  local r t m; r=$(git -C "$d" rev-parse HEAD); put "$d" .env "$2"
+  t=$(git -C "$d" write-tree); m=$(git -C "$d" commit-tree "$t" -p "$l" -p "$r" -m merge); git -C "$d" update-ref HEAD "$m"
+  echo "$d"
+}
+D=$(envmerge v7-envmerge-clean 'STORAGE_BUCKET=merged'); EB=$(git -C "$D" rev-list --max-parents=0 HEAD)
+expect_msg 0 'security\] clean' "env: a merge commit that edits .env scans cleanly" bash -c "cd '$D' && '$SCAN' range $EB HEAD"
+D=$(envmerge v7-envmerge-secret 'API_SECRET=abc'); EB=$(git -C "$D" rev-list --max-parents=0 HEAD)
+expect_msg 1 '\.env file with secret-like values' "env: secret introduced only by a merge's .env resolution" bash -c "cd '$D' && '$SCAN' range $EB HEAD"
+D=$(envmerge v7-envmerge-removed 'API_SECRET=abc'); EB=$(git -C "$D" rev-list --max-parents=0 HEAD); put "$D" .env 'STORAGE_BUCKET=fixed'; commit "$D" fix
+expect_msg 1 '\.env file with secret-like values' "env: merge-only .env secret later removed is still caught" bash -c "cd '$D' && '$SCAN' range $EB HEAD"
+
 echo; echo "$pass passed, $failn failed"
 exit $(( failn > 0 ? 1 : 0 ))
