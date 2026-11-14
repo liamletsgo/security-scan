@@ -106,7 +106,7 @@ jobs:
             echo "| | |"; echo "|---|---|"
             echo "| Deploy | $deploy |"; echo "| Environment | $envname ($PROJECT_ID) |"
             echo "| Commit | \`$GITHUB_SHA\` on \`${REF#refs/heads/}\` by $ACTOR ($EVENT) |"
-            echo "| Baseline | \`${BASELINE:-none}\` |"; echo "| Tools | \`$TOOLS_SHA\` |"
+            echo "| Baseline (manual runs) | \`${BASELINE:-n/a: push or pull request}\` |"; echo "| Tools | \`$TOOLS_SHA\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   scan:
@@ -166,8 +166,10 @@ jobs:
           if [ "$EVENT" != pull_request ]; then
             git merge-base --is-ancestor "$BASE" "$HEAD" || { echo "::error::$BASE is not an ancestor of $HEAD. Run manually with a reviewed baseline."; exit 1; }
           fi
-          echo "base=$(git rev-parse "$BASE^{commit}")" >> "$GITHUB_OUTPUT"
-          echo "head=$(git rev-parse "$HEAD^{commit}")" >> "$GITHUB_OUTPUT"
+          RB=$(git rev-parse "$BASE^{commit}"); RH=$(git rev-parse "$HEAD^{commit}")
+          echo "base=$RB" >> "$GITHUB_OUTPUT"
+          echo "head=$RH" >> "$GITHUB_OUTPUT"
+          echo "Scanned range: \`$RB..$RH\` ($(git rev-list --count "$RB..$RH") commits)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Security scan of the change (blocks on findings)
         env:
@@ -284,6 +286,8 @@ jobs:
         env:
           ENV_FILE: ${{ needs.plan.outputs.env_file }}
           RUNTIME_ACCOUNT: ${{ needs.plan.outputs.runtime_account }}
+          FUNCTION_NAME: ${{ needs.plan.outputs.function_name }}
+          REGION: ${{ needs.plan.outputs.region }}
         run: |
           set -euo pipefail
           FT="$RUNNER_TEMP/tools/firebase/node_modules/firebase-tools"
@@ -291,13 +295,25 @@ jobs:
           git ls-files --error-unmatch "$REVIEWED" >/dev/null
           [ -f "$REVIEWED" ] && [ ! -L "$REVIEWED" ] || { echo "::error::$REVIEWED must be a committed regular file"; exit 1; }
           node "$RUNNER_TEMP/tools/firebase/manifest-check.js" "$FT" "$RUNNER_TEMP/manifest/functions.yaml" "$REVIEWED"
+          # The deployed shape must be exactly the profile's: one endpoint named after the function, that entry point,
+          # exactly the profile's region, the profile's runtime account, and the expected codebase.
           # shellcheck disable=SC2016  # JavaScript source, not shell
           node -e '
+            const fs = require("fs");
             const yaml = require(require.resolve("yaml", { paths: [process.argv[1]] }));
-            const m = yaml.parse(require("fs").readFileSync(process.argv[2], "utf8"));
-            for (const [n, ep] of Object.entries(m.endpoints)) if (ep.serviceAccountEmail !== process.argv[3]) {
-              console.error(`${n}: runtime account must be ${process.argv[3]}`); process.exit(2); }
-          ' "$FT" "$RUNNER_TEMP/manifest/functions.yaml" "$RUNTIME_ACCOUNT"
+            const [, , manifestPath, fn, region, account] = process.argv;
+            const m = yaml.parse(fs.readFileSync(manifestPath, "utf8"));
+            const fail = (msg) => { console.error(`profile: ${msg}`); process.exit(2); };
+            const names = Object.keys(m.endpoints || {});
+            if (names.length !== 1 || names[0] !== fn) fail(`endpoints must be exactly [${fn}], got [${names}]`);
+            const ep = m.endpoints[fn];
+            if (ep.entryPoint !== fn) fail(`entry point must be ${fn}`);
+            if (!Array.isArray(ep.region) || ep.region.length !== 1 || ep.region[0] !== region) fail(`region must be exactly [${region}]`);
+            if (ep.serviceAccountEmail !== account) fail(`runtime account must be ${account}`);
+            const cfg = JSON.parse(fs.readFileSync("firebase.json", "utf8"));
+            const f = Array.isArray(cfg.functions) ? cfg.functions[0] : cfg.functions;
+            if ((f.codebase || "default") !== "default") fail("functions codebase must be default");
+          ' "$FT" "$RUNNER_TEMP/manifest/functions.yaml" "$FUNCTION_NAME" "$REGION" "$RUNTIME_ACCOUNT"
           cp "$RUNNER_TEMP/manifest/functions.yaml" functions.yaml
           git ls-files --error-unmatch "$ENV_FILE" >/dev/null
           [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] || { echo "::error::$ENV_FILE must be a committed regular file"; exit 1; }
