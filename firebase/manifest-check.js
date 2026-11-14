@@ -2,9 +2,10 @@
 // deployed. With functions.yaml in the source folder, firebase-tools reads it instead of running the app's
 // Python, so the credentialed deploy step never executes application code.
 //
-// The manifest must (1) fit a strict profile: one or more gcfv2 HTTPS endpoints only, no invoker list that makes
-// a function public, no secrets, service-account override, extra required APIs, parameters or Data Connect
-// triggers (whose schema files Firebase would upload outside the scanned payload); and (2) equal the reviewed
+// The manifest must (1) fit a strict profile: gcfv2 HTTPS endpoints only, with an allowlist of typed fields: invoker omitted
+// (keeps existing invoker IAM on update), no secrets, service-account fields (other than the null default), VPC,
+// env vars, parameters, extra required APIs or other triggers (Data Connect schema files would be uploaded
+// outside the scanned payload); and (2) equal the reviewed
 // copy committed in the repository, so any change to deployed function settings is a reviewed change.
 //
 // Usage: node manifest-check.js <firebase-tools root> <generated functions.yaml> <reviewed functions.yaml>
@@ -32,19 +33,29 @@ function main() {
   if (!Object.keys(eps).length) fail("no endpoints");
   const triggers = ["httpsTrigger", "callableTrigger", "eventTrigger", "scheduleTrigger", "taskQueueTrigger",
     "blockingTrigger", "dataConnectGraphqlTrigger"];
+  // Endpoint fields are an allowlist with typed values. Invoker must be omitted: Firebase then keeps the
+  // function's existing invoker IAM on update (null or a list would replace it; null means public).
+  const epAllowed = {
+    availableMemoryMb: "number", concurrency: "number|null", cpu: "number|null", entryPoint: "string",
+    httpsTrigger: "object", ingressSettings: "null|ALLOW_ALL|ALLOW_INTERNAL_ONLY|ALLOW_INTERNAL_AND_GCLB",
+    labels: "object", maxInstances: "number|null", minInstances: "number|null", platform: "gcfv2",
+    region: "array", secretEnvironmentVariables: "emptyarray", serviceAccountEmail: "null",
+    timeoutSeconds: "number",
+  };
+  const typeOk = (v, spec) => spec.split("|").some((t) =>
+    t === "null" ? v === null : t === "number" ? typeof v === "number" && Number.isFinite(v)
+    : t === "string" ? typeof v === "string" : t === "object" ? v !== null && typeof v === "object" && !Array.isArray(v)
+    : t === "array" ? Array.isArray(v) : t === "emptyarray" ? Array.isArray(v) && v.length === 0 : v === t);
   for (const [name, ep] of Object.entries(eps)) {
-    const present = triggers.filter((t) => ep[t] !== undefined);
-    if (present.length !== 1 || present[0] !== "httpsTrigger") fail(`${name}: only an HTTPS trigger is allowed (${present})`);
-    const inv = ep.httpsTrigger.invoker;
-    if (inv !== undefined && inv !== null) {
-      if (!Array.isArray(inv) || inv.some((m) => m === "public" || /allUsers|allAuthenticatedUsers/.test(m))) {
-        fail(`${name}: public invoker is not allowed`);
-      }
+    if (ep === null || typeof ep !== "object" || Array.isArray(ep)) fail(`${name}: endpoint must be a mapping`);
+    for (const [k, v] of Object.entries(ep)) {
+      if (!(k in epAllowed)) fail(`${name}: field "${k}" is not allowed (triggers other than HTTPS, service accounts, VPC, env vars, ...)`);
+      if (!typeOk(v, epAllowed[k])) fail(`${name}: field "${k}" has a disallowed value`);
     }
-    if (ep.platform !== "gcfv2") fail(`${name}: platform must be gcfv2`);
-    if ((ep.secretEnvironmentVariables || []).length) fail(`${name}: secret environment variables are not allowed`);
-    if (ep.serviceAccountEmail) fail(`${name}: service account override is not allowed`);
-    if (ep.environmentVariables && Object.keys(ep.environmentVariables).length) fail(`${name}: inline environment variables are not allowed`);
+    for (const k of ["entryPoint", "httpsTrigger", "platform", "region"]) if (!(k in ep)) fail(`${name}: missing ${k}`);
+    if (Object.keys(ep.httpsTrigger).length) fail(`${name}: httpsTrigger must be empty (invoker omitted keeps existing invoker IAM)`);
+    if (!ep.region.every((r) => typeof r === "string")) fail(`${name}: region must be a list of strings`);
+    if (Object.values(ep.labels || {}).some((v) => typeof v !== "string")) fail(`${name}: labels must be strings`);
   }
   try { assert.deepStrictEqual(gen, rev); }
   catch { fail("generated manifest differs from the reviewed copy (update the reviewed functions.yaml in a reviewed commit)"); }

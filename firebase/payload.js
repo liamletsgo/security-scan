@@ -26,13 +26,26 @@ async function main() {
   const out = path.resolve(outArg);
   if (fs.existsSync(out) && fs.readdirSync(out).length) throw new Error(`output dir not empty: ${out}`);
 
+  // Strict configuration profile: anything firebase-tools could use to run commands, import other files or
+  // add sources outside this listing is refused (lifecycle hooks, string/imported configs, remote sources).
   const config = JSON.parse(fs.readFileSync(path.join(src, "firebase.json"), "utf8"));
+  const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  if (!isObj(config)) throw new Error("firebase.json must be an object");
+  for (const k of Object.keys(config)) {
+    if (!["functions", "emulators"].includes(k)) throw new Error(`firebase.json key "${k}" is not supported by this check`);
+  }
   const fns = config.functions;
+  if (!(Array.isArray(fns) && fns.length === 1) && !isObj(fns)) throw new Error("functions must be one inline object");
   const fn = Array.isArray(fns) ? fns[0] : fns;
-  if (!fn || (Array.isArray(fns) && fns.length !== 1)) throw new Error("expected exactly one functions entry");
-  if ((fn.source || ".") !== ".") throw new Error("expected functions source '.'");
-  for (const key of ["additionalSources", "predeploy", "prebuild"]) {
-    if (fn[key] !== undefined) throw new Error(`functions.${key} is not supported by this check`);
+  if (!isObj(fn)) throw new Error("functions entry must be an inline object (no imported config)");
+  const allowed = ["source", "runtime", "region", "codebase", "ignore"];
+  for (const k of Object.keys(fn)) {
+    if (!allowed.includes(k)) throw new Error(`functions.${k} is not supported by this check (hooks, extra sources and remote sources are refused)`);
+  }
+  if (fn.source !== ".") throw new Error("expected functions source '.'");
+  if (typeof fn.runtime !== "string" || !/^python3\d+$/.test(fn.runtime)) throw new Error("expected a python3NN runtime");
+  if (fn.ignore !== undefined && !(Array.isArray(fn.ignore) && fn.ignore.every((x) => typeof x === "string"))) {
+    throw new Error("functions.ignore must be a list of strings");
   }
   if (fs.existsSync(path.join(src, ".runtimeconfig.json"))) throw new Error(".runtimeconfig.json present");
 

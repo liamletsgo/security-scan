@@ -41,6 +41,16 @@ expect 2 "lister: default ignore list (venv uploaded) refused" node "$HERE/paylo
 sed 's/"source": "."/"source": ".", "predeploy": ["x"]/' "$P/firebase.json" >"$WORK/proj2/firebase.json"
 expect 2 "lister: predeploy hooks refused" node "$HERE/payload.js" "$FT" "$VER" "$WORK/proj2" "$WORK/p4"
 
+cfgcase() {  # cfgcase <label> <perl substitution on firebase.json>
+  rm -rf "$WORK/proj3"; cp -r "$P" "$WORK/proj3"; perl -0pi -e "$2" "$WORK/proj3/firebase.json"
+  expect 2 "lister: $1 refused" node "$HERE/payload.js" "$FT" "$VER" "$WORK/proj3" "$WORK/p-$RANDOM"
+}
+cfgcase "postdeploy hook" 's/"source": "."/"source": ".", "postdeploy": ["node hook.js"]/'
+cfgcase "imported (string) functions config" 's/"functions": \[.*\]\s*\}\s*\z/"functions": "functions-config.json" }\n/s'
+cfgcase "unknown functions key" 's/"source": "."/"source": ".", "remoteSource": {}/'
+cfgcase "unknown top-level key" 's/^\{/{ "hosting": {"predeploy": ["x"]},/'
+cfgcase "non-Python runtime" 's/"python313"/"nodejs22"/'
+
 # manifest check
 M="$WORK/m.yaml"
 cat >"$M" <<'YAML'
@@ -73,6 +83,16 @@ mut 's/serviceAccountEmail: null/serviceAccountEmail: x\@y.iam.gserviceaccount.c
 expect 2 "manifest: service-account override refused" node "$HERE/manifest-check.js" "$FT" "$WORK/sa.yaml" "$WORK/sa.yaml"
 mut 's/^params: \[\]/params: [{name: P}]/' params
 expect 2 "manifest: parameters refused" node "$HERE/manifest-check.js" "$FT" "$WORK/params.yaml" "$WORK/params.yaml"
+mut 's/serviceAccountEmail: null/serviceAccountEmail: null\n    serviceAccount: x\@y.iam.gserviceaccount.com/' sa2
+expect 2 "manifest: canonical serviceAccount field refused" node "$HERE/manifest-check.js" "$FT" "$WORK/sa2.yaml" "$WORK/sa2.yaml"
+mut 's/httpsTrigger: \{\}/httpsTrigger: {invoker: null}/' invnull
+expect 2 "manifest: invoker null (public on update) refused" node "$HERE/manifest-check.js" "$FT" "$WORK/invnull.yaml" "$WORK/invnull.yaml"
+mut 's/httpsTrigger: \{\}/httpsTrigger: {invoker: [a\@b.iam.gserviceaccount.com, c\@d.iam.gserviceaccount.com]}/' invlist
+expect 2 "manifest: explicit invoker list (replaces IAM) refused" node "$HERE/manifest-check.js" "$FT" "$WORK/invlist.yaml" "$WORK/invlist.yaml"
+mut 's/platform: gcfv2/platform: gcfv2\n    vpc: {connector: x}/' vpc
+expect 2 "manifest: unknown endpoint field refused" node "$HERE/manifest-check.js" "$FT" "$WORK/vpc.yaml" "$WORK/vpc.yaml"
+mut 's/availableMemoryMb: 512/availableMemoryMb: "512"/' badtype
+expect 2 "manifest: wrongly typed field refused" node "$HERE/manifest-check.js" "$FT" "$WORK/badtype.yaml" "$WORK/badtype.yaml"
 printf 'extra: 1\n' >>"$WORK/changed.yaml"; cp "$WORK/changed.yaml" "$WORK/extra.yaml"
 expect 2 "manifest: unknown top-level key refused" node "$HERE/manifest-check.js" "$FT" "$WORK/extra.yaml" "$WORK/extra.yaml"
 
@@ -93,6 +113,10 @@ run_c() { env PATH="$FB:$PATH" FAKE_SVC="$1" FAKE_POLICY="$2" FAKE_CODE="$3" bas
 expect 0 "containment: private service, anonymous 403" run_c projects/p/locations/r/services/fn "$WORK/private.json" 403
 expect 1 "containment: public invoker fails" run_c projects/p/locations/r/services/fn "$WORK/public.json" 403
 expect 1 "containment: anonymous 200 fails" run_c projects/p/locations/r/services/fn "$WORK/private.json" 200
+printf 'not json' >"$WORK/bad.json"; printf '{"bindings": "x"}' >"$WORK/bad2.json"; printf '{"etag": "BwX"}' >"$WORK/empty.json"
+expect 1 "containment: malformed policy fails" run_c projects/p/locations/r/services/fn "$WORK/bad.json" 403
+expect 1 "containment: non-policy JSON fails" run_c projects/p/locations/r/services/fn "$WORK/bad2.json" 403
+expect 0 "containment: policy with no bindings (no invokers) passes" run_c projects/p/locations/r/services/fn "$WORK/empty.json" 403
 expect 1 "containment: unreadable function fails" run_c "" "$WORK/private.json" 403
 
 echo; echo "$pass passed, $failn failed"
