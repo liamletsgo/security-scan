@@ -288,9 +288,13 @@ while IFS= read -r -d '' f; do
     staged) n=$((n+1)); "${G[@]}" show ":$f" >"$TMP/env.$n" || die "cannot read staged $f" ;;
     tree)   n=$((n+1)); cat -- "$DIR/$f" >"$TMP/env.$n" || die "cannot read $f" ;;
     range)
-      "${G[@]}" log "${HIST[@]}" --format=%H "$RANGE" -- ":(literal)$f" >"$TMP/env.commits"
+      # --no-patch: with --diff-merges=separate, git log also prints a merge commit's diff, which must not
+      # be read as commit names. Every line is still checked to be a full commit id before use.
+      "${G[@]}" log "${HIST[@]}" --no-patch --format=%H "$RANGE" -- ":(literal)$f" >"$TMP/env.commits" \
+        || die "cannot list the history of $f"
       echo "$HEAD_C" >>"$TMP/env.commits"
       while IFS= read -r c; do
+        [[ $c =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || die "unexpected commit id in the history of $f: $c"
         in_tree "$c" "$f" || continue          # deleted in this commit
         n=$((n+1)); "${G[@]}" show "$c:$f" >"$TMP/env.$n" || die "cannot read $f at $c"
       done <"$TMP/env.commits"
