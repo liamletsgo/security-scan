@@ -85,6 +85,10 @@ mut 's/^params: \[\]/params: [{name: P}]/' params
 expect 2 "manifest: parameters refused" node "$HERE/manifest-check.js" "$FT" "$WORK/params.yaml" "$WORK/params.yaml"
 mut 's/serviceAccountEmail: null/serviceAccountEmail: null\n    serviceAccount: x\@y.iam.gserviceaccount.com/' sa2
 expect 2 "manifest: canonical serviceAccount field refused" node "$HERE/manifest-check.js" "$FT" "$WORK/sa2.yaml" "$WORK/sa2.yaml"
+mut 's/serviceAccountEmail: null/serviceAccountEmail: pmj-backend\@/' samesa
+expect 0 "manifest: same-project runtime account (name@) accepted" node "$HERE/manifest-check.js" "$FT" "$WORK/samesa.yaml" "$WORK/samesa.yaml"
+mut 's/serviceAccountEmail: null/serviceAccountEmail: pmj-backend\@other-project.iam.gserviceaccount.com/' othersa
+expect 2 "manifest: runtime account in another project refused" node "$HERE/manifest-check.js" "$FT" "$WORK/othersa.yaml" "$WORK/othersa.yaml"
 mut 's/httpsTrigger: \{\}/httpsTrigger: {invoker: null}/' invnull
 expect 2 "manifest: invoker null (public on update) refused" node "$HERE/manifest-check.js" "$FT" "$WORK/invnull.yaml" "$WORK/invnull.yaml"
 mut 's/httpsTrigger: \{\}/httpsTrigger: {invoker: [a\@b.iam.gserviceaccount.com, c\@d.iam.gserviceaccount.com]}/' invlist
