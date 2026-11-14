@@ -91,4 +91,88 @@ expect 2 "error: unknown mode" "$SCAN" nonsense
 expect 2 "error: not a git repository" bash -c "cd '$WORK' && mkdir -p plain && cd plain && '$SCAN' staged"
 expect 2 "error: gitleaks missing" bash -c "cd '$R' && GITLEAKS=/nonexistent/gitleaks '$SCAN' range $BASE HEAD"
 
+
+# ---------------- regression tests for the Codex review findings ----------------
+FAKE="$WORK/fake"; mkdir -p "$FAKE"
+printf '#!/bin/sh\necho "12:00PM ERR failed to read git history"\nexit 0\n' >"$FAKE/gitleaks-err0"; chmod +x "$FAKE/gitleaks-err0"
+printf '#!/bin/sh\necho "fatal: something broke"\nexit 1\n' >"$FAKE/gitleaks-exit1"; chmod +x "$FAKE/gitleaks-exit1"
+expect 2 "gitleaks logs an error but exits 0 -> incomplete scan, error" bash -c "cd '$R' && GITLEAKS='$FAKE/gitleaks-err0' '$SCAN' range $BASE HEAD"
+expect 2 "gitleaks error exit (not findings) -> error" bash -c "cd '$R' && GITLEAKS='$FAKE/gitleaks-exit1' '$SCAN' range $BASE HEAD"
+
+# real provider-style secret is caught by gitleaks itself (synthetic token)
+TOKEN="ghp_$(printf 'Zq8Lm3Rt7Vx2Bn6Kp4Wd9Hs1Fg5Jc0Ya7Ue3To')"
+D=$(newrepo provider); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" config.txt "token = \"$TOKEN\""; commit "$D" add
+expect 1 "gitleaks: provider-style token detected" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# the scanned repository cannot weaken gitleaks (own config, ignore file, inline allow)
+D=$(newrepo policy); put "$D" .gitleaks.toml '[allowlist]
+paths = [".*"]'; put "$D" .gitleaksignore '*'; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" config.txt "token = \"$TOKEN\" # gitleaks:allow"; commit "$D" add
+expect 1 "gitleaks: repo config, ignore file and inline allow are ignored" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# a secret introduced only while resolving a merge
+D=$(newrepo mergeonly); put "$D" a.txt one; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" a.txt left; commit "$D" left; L=$(git -C "$D" rev-parse HEAD)
+git -C "$D" update-ref HEAD "$B"; git -C "$D" read-tree "$B"; put "$D" a.txt right; commit "$D" right; RR=$(git -C "$D" rev-parse HEAD)
+put "$D" a.txt "resolved"; put "$D" config.txt "token = \"$TOKEN\""
+T=$(git -C "$D" write-tree); M=$(git -C "$D" commit-tree "$T" -p "$L" -p "$RR" -m merge); git -C "$D" update-ref HEAD "$M"
+expect 1 "merge: secret added only in the merge resolution is caught" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# .env variants
+envcase() {  # envcase <label> <file> <content> <want>
+  local d; d=$(newrepo "env-$1"); put "$d" README.txt base; commit "$d" init; local b; b=$(git -C "$d" rev-parse HEAD)
+  put "$d" "$2" "$3"; commit "$d" env
+  expect "$4" ".env: $1" bash -c "cd '$d' && '$SCAN' range $b HEAD"
+}
+envcase "production.local name" .env.production.local 'API_KEY=abc' 1
+envcase "export and spaces" .env 'export  DB_PASSWORD = hunter2' 1
+envcase "example file ignored" .env.example 'API_KEY=placeholder' 0
+envcase "non-secret values pass" .env 'STORAGE_BUCKET=my-bucket' 0
+D=$(newrepo env-history); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" .env 'API_SECRET=abc'; commit "$D" add; put "$D" .env 'STORAGE_BUCKET=x'; commit "$D" fix
+expect 1 ".env: secret in an earlier version of the range is caught" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# file name containing a newline
+D=$(newrepo newline); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+NL="dir
+name"; mkdir -p "$D/$NL"; printf 'API_KEY=abc\n' >"$D/$NL/.env"; git -C "$D" add -- "$NL/.env"; commit "$D" nl
+expect 1 "names: .env inside a directory whose name contains a newline" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# type change: symlink replaced by a real file with risky content
+D=$(newrepo typechange); put "$D" target.txt x; ln -s target.txt "$D/storage.py"; git -C "$D" add storage.py; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+rm "$D/storage.py"; put "$D" storage.py 'blob.make_public()'; commit "$D" tc
+expect 1 "type change: symlink turned into a file is scanned" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# content line that itself starts with '+'
+D=$(newrepo plusline); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" app.js '+blob.make_public()'; commit "$D" plus
+expect 1 "diff: added line starting with + is still checked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# file marked -diff / binary in .gitattributes is still read as text
+D=$(newrepo attrs); put "$D" .gitattributes '*.cfg -diff'; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" deploy.cfg 'x = make_public()'; commit "$D" cfg
+expect 1 "diff: -diff attribute does not hide content" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# divergent branches: a risky line removed on the base branch after divergence is not blamed on head
+D=$(newrepo divergent); put "$D" old.py 'x = "allUsers"'; commit "$D" init
+git -C "$D" rev-parse HEAD >/dev/null; ROOT=$(git -C "$D" rev-parse HEAD)
+put "$D" feature.py 'print(1)'; commit "$D" feature; HEADC=$(git -C "$D" rev-parse HEAD)
+git -C "$D" update-ref HEAD "$ROOT"; git -C "$D" read-tree "$ROOT"; git -C "$D" rm -q --cached old.py; rm -f "$D/old.py"; commit "$D" cleanup; BASEC=$(git -C "$D" rev-parse HEAD)
+expect 0 "range: changes made only on the base branch are not blamed on head" bash -c "cd '$D' && '$SCAN' range $BASEC $HEADC"
+
+# shallow clone refuses to scan
+SH="$WORK/shallow"; git clone -q --depth 1 "file://$R" "$SH" 2>/dev/null
+expect 2 "history: shallow clone is an error" bash -c "cd '$SH' && '$SCAN' range HEAD HEAD"
+
+# tree: symlink and unreadable file
+T="$WORK/tree-link"; mkdir -p "$T"; echo ok >"$T/a.py"; ln -s /etc/hosts "$T/hosts"
+expect 1 "tree: symlink in a deploy payload is blocked" "$SCAN" tree "$T"
+if [ "$(id -u)" != 0 ]; then
+  T="$WORK/tree-unreadable"; mkdir -p "$T"; echo secret >"$T/locked.py"; chmod 000 "$T/locked.py"
+  expect 2 "tree: unreadable file is an error, not clean" "$SCAN" tree "$T"
+  chmod 600 "$T/locked.py"
+fi
+expect 2 "tree: missing directory argument" "$SCAN" tree
+
 echo; echo "$pass passed, $failn failed"; [ "$failn" -eq 0 ]
