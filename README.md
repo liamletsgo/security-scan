@@ -150,6 +150,27 @@ and verified by SHA-256 each:
 `firebase/test.sh` checks the lister against firebase-tools' own packaging on a fixture project and exercises the
 manifest profile (CI job "firebase helpers").
 
+## Reusable deploy workflow (`.github/workflows/firebase-deploy.yml`)
+
+A Firebase Functions (Python) backend calls it with
+`uses: liamletsgo/security-scan/.github/workflows/firebase-deploy.yml@main` and its own settings (project,
+environment file, function name, tests). Jobs: scan (range scan + tests, read-only) → discover (runs the app once on
+a throwaway copy, no cloud access) → build (manifest check, exact payload, tree scan, read-only) → deploy (the only
+job that can request a Google token; runs no repository code or Python; branch-tip check; deploys the checked
+payload; containment check). Tools are taken from this repository's protected `main`.
+
+Bind deploy credentials to it in each project's Workload Identity provider condition, for example:
+
+```
+assertion.repository == 'OWNER/BACKEND' && assertion.actor == 'OWNER' &&
+assertion.ref in ['refs/heads/main', 'refs/heads/DEV_BRANCH'] &&
+assertion.job_workflow_ref == 'liamletsgo/security-scan/.github/workflows/firebase-deploy.yml@refs/heads/main'
+```
+
+Google then issues deploy credentials only to this reviewed workflow from this repository's protected `main`,
+whatever the backend repository's own workflow file says: a useful control where the backend repository cannot have
+branch protection (private repositories on GitHub Free).
+
 ## Tests
 
 `tests/run-tests.sh` (bash, git, perl, gitleaks). CI runs them on Linux and on macOS with the system

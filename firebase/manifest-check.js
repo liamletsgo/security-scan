@@ -3,7 +3,8 @@
 // Python, so the credentialed deploy step never executes application code.
 //
 // The manifest must (1) fit a strict profile: gcfv2 HTTPS endpoints only, with an allowlist of typed fields: invoker omitted
-// (keeps existing invoker IAM on update), no secrets, service-account fields (other than the null default), VPC,
+// (keeps existing invoker IAM on update), no secrets, service-account fields (other than the default or a same-project
+// "name@" account), VPC,
 // env vars, parameters, extra required APIs or other triggers (Data Connect schema files would be uploaded
 // outside the scanned payload); and (2) equal the reviewed
 // copy committed in the repository, so any change to deployed function settings is a reviewed change.
@@ -39,13 +40,15 @@ function main() {
     availableMemoryMb: "number", concurrency: "number|null", cpu: "number|null", entryPoint: "string",
     httpsTrigger: "object", ingressSettings: "null|ALLOW_ALL|ALLOW_INTERNAL_ONLY|ALLOW_INTERNAL_AND_GCLB",
     labels: "object", maxInstances: "number|null", minInstances: "number|null", platform: "gcfv2",
-    region: "array", secretEnvironmentVariables: "emptyarray", serviceAccountEmail: "null",
+    region: "array", secretEnvironmentVariables: "emptyarray", serviceAccountEmail: "null|sameproject",
     timeoutSeconds: "number",
   };
   const typeOk = (v, spec) => spec.split("|").some((t) =>
     t === "null" ? v === null : t === "number" ? typeof v === "number" && Number.isFinite(v)
     : t === "string" ? typeof v === "string" : t === "object" ? v !== null && typeof v === "object" && !Array.isArray(v)
-    : t === "array" ? Array.isArray(v) : t === "emptyarray" ? Array.isArray(v) && v.length === 0 : v === t);
+    : t === "array" ? Array.isArray(v) : t === "emptyarray" ? Array.isArray(v) && v.length === 0
+    // a dedicated runtime account in the deploying project only: "name@" (Firebase appends the project)
+    : t === "sameproject" ? typeof v === "string" && /^[a-z][a-z0-9-]{4,28}[a-z0-9]@$/.test(v) : v === t);
   for (const [name, ep] of Object.entries(eps)) {
     if (ep === null || typeof ep !== "object" || Array.isArray(ep)) fail(`${name}: endpoint must be a mapping`);
     for (const [k, v] of Object.entries(ep)) {

@@ -1,0 +1,359 @@
+name: firebase-deploy (reusable)
+
+# Reusable scan → manifest → build → deploy pipeline for a Firebase Functions (Python) backend.
+# Call it from the backend repository as
+#   uses: liamletsgo/security-scan/.github/workflows/firebase-deploy.yml@main
+# The deploying project's Workload Identity Federation condition should require
+#   assertion.job_workflow_ref == 'liamletsgo/security-scan/.github/workflows/firebase-deploy.yml@refs/heads/main'
+# so Google issues deploy credentials only to this reviewed workflow from this repository's protected main,
+# whatever the calling repository's own workflow says. Tools come from the same protected main.
+#
+# Jobs: scan (range scan + tests; read-only) → discover (runs the app once on a throwaway copy, no cloud access) →
+# build (manifest check, exact payload, tree scan; read-only) → deploy (the only job that can request a Google
+# token; runs no repository code or Python; branch-tip check; deploys the checked payload; containment check).
+
+on:
+  workflow_call:
+    inputs:
+      deploy:
+        description: 'Run discover/build/deploy after the scan'
+        type: boolean
+        default: false
+      environment:
+        type: string
+        default: ''
+      project_id:
+        type: string
+        default: ''
+      project_number:
+        type: string
+        default: ''
+      env_file:
+        description: 'Environment file copied to .env for the deploy (e.g. .env.dev)'
+        type: string
+        default: ''
+      baseline:
+        description: 'Reviewed baseline commit for manual runs'
+        type: string
+        default: ''
+      region:
+        type: string
+        default: asia-northeast1
+      function_name:
+        type: string
+        default: ''
+      containment_path:
+        description: 'Path for the anonymous request in the containment check'
+        type: string
+        default: /
+      reviewed_manifest:
+        type: string
+        default: .github/functions.manifest.yaml
+      test_command:
+        description: 'Unit tests to run after installing requirements.txt (empty: none)'
+        type: string
+        default: ''
+      python_version:
+        type: string
+        default: '3.13'
+    outputs:
+      deployed:
+        description: 'true when the deploy job completed'
+        value: ${{ jobs.deploy.outputs.deployed }}
+
+permissions: {}
+
+env:
+  GITLEAKS_ASSET: gitleaks_8.30.1_linux_x64.tar.gz
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  TOOLS_REPO: liamletsgo/security-scan
+  TOOLS_REF: main
+  FIREBASE_TOOLS_VERSION: 15.18.0
+
+jobs:
+  scan:
+    name: security scan and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout the reviewed tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: ${{ env.TOOLS_REPO }}
+          ref: ${{ env.TOOLS_REF }}
+          path: .security-tools
+          persist-credentials: false
+
+      - name: Install pinned gitleaks (checksum verified)
+        run: |
+          set -euo pipefail
+          mv .security-tools "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP"
+          curl -sSfL --retry 3 --max-time 120 -o "$GITLEAKS_ASSET" "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/$GITLEAKS_ASSET"
+          echo "$GITLEAKS_SHA256  $GITLEAKS_ASSET" | sha256sum -c -
+          tar -xzf "$GITLEAKS_ASSET" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Choose the range to scan
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request)      BASE=$PR_BASE;  HEAD=$PR_HEAD ;;
+            push)              BASE=$BEFORE;   HEAD=$AFTER ;;
+            workflow_dispatch) BASE=$BASELINE; HEAD=$AFTER ;;
+            *) echo "::error::unsupported event $EVENT"; exit 1 ;;
+          esac
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            echo "::error::no previous commit to scan from (new branch?). Run the workflow manually with a reviewed baseline."; exit 1
+          fi
+          [[ "$BASE" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::baseline must be a commit SHA"; exit 1; }
+          git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || { echo "::error::baseline $BASE is not in this repository"; exit 1; }
+          if [ "$EVENT" != pull_request ]; then
+            git merge-base --is-ancestor "$BASE" "$HEAD" || { echo "::error::$BASE is not an ancestor of $HEAD. Run manually with a reviewed baseline."; exit 1; }
+          fi
+          echo "base=$(git rev-parse "$BASE^{commit}")" >> "$GITHUB_OUTPUT"
+          echo "head=$(git rev-parse "$HEAD^{commit}")" >> "$GITHUB_OUTPUT"
+
+      - name: Security scan of the change (blocks on findings)
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+          HEAD: ${{ steps.range.outputs.head }}
+        run: bash "$RUNNER_TEMP/tools/security-scan.sh" range "$BASE" "$HEAD"
+
+      - name: Setup Python
+        if: inputs.test_command != ''
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Unit tests
+        if: inputs.test_command != ''
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -q --only-binary=:all: --require-hashes -r requirements.txt
+          bash -c "$TEST_COMMAND"
+
+  discover:
+    name: functions manifest (runs the app, no cloud access)
+    needs: scan
+    if: inputs.deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout the reviewed tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: ${{ env.TOOLS_REPO }}
+          ref: ${{ env.TOOLS_REF }}
+          path: .security-tools
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Generate the manifest on a throwaway copy
+        run: |
+          set -euo pipefail
+          mv .security-tools "$RUNNER_TEMP/tools"
+          mkdir -p "$RUNNER_TEMP/copy" "$RUNNER_TEMP/out"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/copy"
+          cd "$RUNNER_TEMP/copy"
+          python -m venv venv
+          venv/bin/python -m pip install --disable-pip-version-check -q --only-binary=:all: --require-hashes -r requirements.txt
+          bash "$RUNNER_TEMP/tools/firebase/discover.sh" . discovery-only > "$RUNNER_TEMP/out/functions.yaml"
+
+      - name: Hand the manifest to the build job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: functions-manifest
+          path: ${{ runner.temp }}/out/functions.yaml
+          retention-days: 1
+          if-no-files-found: error
+
+  build:
+    name: build and scan the deploy payload
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      payload_sha256: ${{ steps.pack.outputs.payload_sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout the reviewed tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: ${{ env.TOOLS_REPO }}
+          ref: ${{ env.TOOLS_REF }}
+          path: .security-tools
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: Install pinned tools (gitleaks checksum verified; CLI from its lockfile, no install scripts)
+        run: |
+          set -euo pipefail
+          mv .security-tools "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP"
+          curl -sSfL --retry 3 --max-time 120 -o "$GITLEAKS_ASSET" "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/$GITLEAKS_ASSET"
+          echo "$GITLEAKS_SHA256  $GITLEAKS_ASSET" | sha256sum -c -
+          tar -xzf "$GITLEAKS_ASSET" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          (cd tools/firebase && npm ci --ignore-scripts --no-audit --no-fund)
+
+      - name: Receive the manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: functions-manifest
+          path: ${{ runner.temp }}/manifest
+
+      - name: Check the manifest, select the environment file, assemble and scan the payload
+        env:
+          REVIEWED: ${{ inputs.reviewed_manifest }}
+          ENV_FILE: ${{ inputs.env_file }}
+        run: |
+          set -euo pipefail
+          FT="$RUNNER_TEMP/tools/firebase/node_modules/firebase-tools"
+          node "$RUNNER_TEMP/tools/firebase/manifest-check.js" "$FT" "$RUNNER_TEMP/manifest/functions.yaml" "$REVIEWED"
+          cp "$RUNNER_TEMP/manifest/functions.yaml" functions.yaml
+          [[ "$ENV_FILE" =~ ^\.env\.[a-z0-9]+$ ]] || { echo "::error::env_file must look like .env.<name>"; exit 1; }
+          mv .env .env1
+          cp "$ENV_FILE" .env
+          node "$RUNNER_TEMP/tools/firebase/payload.js" "$FT" "$FIREBASE_TOOLS_VERSION" . "$RUNNER_TEMP/payload"
+          test -f "$RUNNER_TEMP/payload/functions.yaml"
+          bash "$RUNNER_TEMP/tools/security-scan.sh" tree "$RUNNER_TEMP/payload"
+
+      - name: Package the payload
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/artifact"
+          tar -C "$RUNNER_TEMP/payload" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf "$RUNNER_TEMP/artifact/payload.tar" .
+          echo "payload_sha256=$(sha256sum "$RUNNER_TEMP/artifact/payload.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Hand the payload to the deploy job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: deploy-payload
+          path: ${{ runner.temp }}/artifact/payload.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read    # branch-tip check only
+      id-token: write   # the only job that can request a Google token
+    concurrency:
+      group: firebase-deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    outputs:
+      deployed: ${{ steps.deploy.outcome == 'success' }}
+    env:
+      PAYLOAD_SHA256: ${{ needs.build.outputs.payload_sha256 }}
+      PROJECT_ID: ${{ inputs.project_id }}
+      REGION: ${{ inputs.region }}
+      FUNCTION: ${{ inputs.function_name }}
+      CONTAINMENT_PATH: ${{ inputs.containment_path }}
+    steps:
+      - name: Checkout the reviewed tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: ${{ env.TOOLS_REPO }}
+          ref: ${{ env.TOOLS_REF }}
+          path: tools
+          persist-credentials: false
+
+      - name: Receive the payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: deploy-payload
+          path: ${{ runner.temp }}/artifact
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: Verify and unpack the payload; install the CLI from its lockfile (no install scripts)
+        run: |
+          set -euo pipefail
+          mv tools "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP"
+          echo "$PAYLOAD_SHA256  artifact/payload.tar" | sha256sum -c -
+          (cd tools/firebase && npm ci --ignore-scripts --no-audit --no-fund)
+          mkdir -p deploy expected
+          tar -C deploy -xf artifact/payload.tar
+          tar -C expected -xf artifact/payload.tar
+          test -f deploy/functions.yaml
+          [[ "$FUNCTION" =~ ^[a-z][a-z0-9_-]*$ ]] || { echo "::error::invalid function name"; exit 1; }
+          [[ "$PROJECT_ID" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || { echo "::error::invalid project id"; exit 1; }
+
+      - name: Confirm this is still the branch tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$GITHUB_REF_NAME" --jq .object.sha)
+          [ "$tip" = "$GITHUB_SHA" ] || { echo "::error::$GITHUB_REF_NAME has moved on ($tip); not deploying the older $GITHUB_SHA"; exit 1; }
+
+      - name: Authenticate to Google Cloud (keyless)
+        id: auth
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
+        with:
+          workload_identity_provider: projects/${{ inputs.project_number }}/locations/global/workloadIdentityPools/github/providers/github-oidc
+          service_account: github-deployer@${{ inputs.project_id }}.iam.gserviceaccount.com
+
+      - name: Deploy (Firebase reads functions.yaml; the app is not run here)
+        id: deploy
+        working-directory: ${{ runner.temp }}/deploy
+        run: |
+          set -euo pipefail
+          FT="$RUNNER_TEMP/tools/firebase/node_modules/firebase-tools"
+          rm -rf "$RUNNER_TEMP/check"
+          node "$RUNNER_TEMP/tools/firebase/payload.js" "$FT" "$FIREBASE_TOOLS_VERSION" . "$RUNNER_TEMP/check"
+          diff -r "$RUNNER_TEMP/expected" "$RUNNER_TEMP/check"
+          test ! -e venv
+          "$RUNNER_TEMP/tools/firebase/node_modules/.bin/firebase" deploy --only "functions:$FUNCTION" --project "$PROJECT_ID" --force --non-interactive
+
+      - name: Containment checks (fails if the function is public)
+        if: always() && steps.auth.outcome == 'success'
+        run: bash "$RUNNER_TEMP/tools/firebase/containment.sh" "$FUNCTION" "$REGION" "$PROJECT_ID" "$CONTAINMENT_PATH"
