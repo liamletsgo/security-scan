@@ -10,14 +10,19 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
+    name: tests (${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - label: linux
+            os: ubuntu-latest
+            shell: bash
             asset: gitleaks_8.30.1_linux_x64.tar.gz
             sha256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
-          - os: macos-latest
+          - label: macos
+            os: macos-latest
+            shell: /bin/bash
             asset: gitleaks_8.30.1_darwin_arm64.tar.gz
             sha256: b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
     runs-on: ${{ matrix.os }}
@@ -38,8 +43,26 @@ jobs:
           tar -xzf "$ASSET" gitleaks
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Run tests
+        env:
+          TEST_SHELL: ${{ matrix.shell }}
         run: |
           git config --global user.email ci@example.invalid
           git config --global user.name ci
           gitleaks version
-          bash tests/run-tests.sh
+          perl -v | head -2
+          git --version
+          "$TEST_SHELL" --version | head -1
+          "$TEST_SHELL" tests/run-tests.sh
+  firebase:
+    name: firebase helpers
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '22'
+      - name: Run Firebase helper tests
+        run: bash firebase/test.sh

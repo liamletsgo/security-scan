@@ -1,0 +1,8 @@
+{
+  "name": "security-scan-firebase-tools",
+  "private": true,
+  "description": "Pinned Firebase CLI for keyless deploys; install with: npm ci --ignore-scripts",
+  "dependencies": {
+    "firebase-tools": "15.18.0"
+  }
+}
