@@ -10,14 +10,17 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
+    name: tests (${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - label: linux
+            os: ubuntu-latest
             asset: gitleaks_8.30.1_linux_x64.tar.gz
             sha256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
-          - os: macos-latest
+          - label: macos
+            os: macos-latest
             asset: gitleaks_8.30.1_darwin_arm64.tar.gz
             sha256: b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
     runs-on: ${{ matrix.os }}
@@ -42,4 +45,5 @@ jobs:
           git config --global user.email ci@example.invalid
           git config --global user.name ci
           gitleaks version
+          perl -v | head -2
           bash tests/run-tests.sh

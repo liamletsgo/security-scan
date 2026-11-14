@@ -7,20 +7,27 @@
 #                                           base..head (merges against each parent) and the net diff
 #                                           from merge-base(base, head) to head (pre-push, CI)
 #   security-scan.sh tree <dir>             scan the files of a directory as they are (deploy payload)
+# Run from the repository root (staged and range modes).
 #
 # Checks: secrets (gitleaks, required, with a policy the scanned repository cannot change), credential
 # and key files, .env files with secret-like values, client data files (spreadsheets, exports, dumps),
-# symlinks in a deploy payload, and risky code patterns (public storage objects, open Firebase rules,
-# service-account key loading, secrets exposed via NEXT_PUBLIC_, personal deploy tokens, install hooks).
+# symlinks and archives in a deploy payload, and risky code patterns (public storage objects, open
+# Firebase rules, service-account key loading, secrets exposed via NEXT_PUBLIC_, personal deploy tokens,
+# install hooks).
+#
+# How input is produced: the scanner runs git itself (text diffs; no textconv or external diff; config
+# that could change the output is pinned), checks git's exit status, and extracts added lines with a
+# strict patch parser that fails on anything it cannot account for. gitleaks only reads that text on
+# stdin, so its git integration, path-based exclusions and binary-diff skipping are never involved.
 #
 # Exit codes: 0 = clean, 1 = findings (blocked), 2 = scanner error (blocks; never reported as clean).
 # Environment (set by the caller, not by the scanned repository):
 #   SCAN_ALLOW_DATA_FILES=true    report data files as warnings instead of findings (synthetic fixtures)
 #   GITLEAKS                      gitleaks binary (default: first on PATH)
 # Markdown files (*.md) are excluded from the risky-pattern check only; gitleaks still scans them.
-set -euo pipefail
+set -Eeuo pipefail
 export LC_ALL=C
-unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML 2>/dev/null || true
+unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML GIT_EXTERNAL_DIFF GIT_DIFF_OPTS 2>/dev/null || true
 
 RED=$'\033[31m'; YEL=$'\033[33m'; NC=$'\033[0m'
 [ -t 2 ] || { RED=""; YEL=""; NC=""; }
@@ -39,14 +46,21 @@ grepq() { local rc=0; grep "$@" >/dev/null 2>"$TMP/grep.err" || rc=$?; [ $rc -le
 MODE=${1:-}
 GITLEAKS=${GITLEAKS:-$(command -v gitleaks || true)}
 [ -n "$GITLEAKS" ] && [ -x "$GITLEAKS" ] || die "gitleaks is required (install a pinned release); refusing to report clean without a secret scan"
+command -v perl >/dev/null 2>&1 || die "perl is required (patch parser)"
+
+# git with every setting that could alter diff output pinned
+G=(git -c core.quotePath=false -c diff.noprefix=false -c diff.mnemonicPrefix=false -c diff.relative=false
+       -c color.ui=never -c log.showSignature=false -c core.attributesFile=/dev/null)
+DIFF=(--text --no-textconv --no-ext-diff --no-color -U0)
 
 need_complete_git() {
   git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
   [ "$(git rev-parse --is-shallow-repository)" = false ] || die "shallow clone: fetch the full history (fetch-depth: 0) so the whole range can be scanned"
+  [ -z "$(git rev-parse --show-cdup)" ] || die "run from the repository root"
 }
 
 case "$MODE" in
-  staged) need_complete_git ;;
+  staged) [ $# -eq 1 ] || die "usage: security-scan.sh staged"; need_complete_git ;;
   range)
     [ $# -eq 3 ] || die "usage: security-scan.sh range <base> <head>"
     need_complete_git
@@ -63,61 +77,85 @@ case "$MODE" in
   *) die "usage: security-scan.sh staged | range <base> <head> | tree <dir>" ;;
 esac
 
-# ---- 1. secrets: gitleaks with a fixed policy -------------------------------------------------------
-# Built-in rules only; the scanned repository's .gitleaks.toml, .gitleaksignore and inline
-# "gitleaks:allow" comments are ignored. Findings use exit code 3 so they cannot be confused with errors.
-printf '[extend]\nuseDefault = true\n' >"$TMP/gitleaks.toml"
-mkdir -p "$TMP/noignore"
-GL_FLAGS=(--config "$TMP/gitleaks.toml" --gitleaks-ignore-path "$TMP/noignore" --ignore-gitleaks-allow
-          --redact --no-banner --exit-code 3 --log-level warn)
-gl() {  # gl <label> <gitleaks args...>; stdin passed through
-  local label=$1; shift; local rc=0
-  "$GITLEAKS" "$@" "${GL_FLAGS[@]}" >"$TMP/gl.out" 2>&1 || rc=$?
-  if [ $rc -eq 3 ]; then cat "$TMP/gl.out" >&2; block "secrets detected ($label)"
-  elif [ $rc -ne 0 ]; then cat "$TMP/gl.out" >&2; die "gitleaks failed ($label, exit $rc)"
-  elif grepq -aiE '(^|[[:space:]])(ERR|ERROR|FTL|FATAL)([[:space:]]|$)|level=(error|fatal)|(WRN|WARN).*(fail|error|unable|skip|could not|cannot)' "$TMP/gl.out"; then
-    cat "$TMP/gl.out" >&2; die "gitleaks reported errors but exited 0 ($label): treating the scan as incomplete"
-  fi
+# ---- patch parser ---------------------------------------------------------------------------------------
+# Reads a unified diff (git diff / git log -p) and writes every added line to $1 (all files) and to $2
+# (all files except *.md). Hunk boundaries come from the @@ line counts, so a content line that looks
+# like a header can never be dropped. Anything unexpected, or a truncated hunk, is an error.
+parse_patch() {
+  perl -e '
+    use strict; use warnings;
+    open(my $all, ">", $ARGV[0]) or die "open: $!\n"; open(my $code, ">", $ARGV[1]) or die "open: $!\n";
+    binmode STDIN; binmode $all; binmode $code;
+    my ($old, $new, $md) = (0, 0, 0);
+    while (defined(my $l = <STDIN>)) {
+      if ($old > 0 || $new > 0) {
+        my $c = substr($l, 0, 1);
+        if    ($c eq "+") { my $t = substr($l, 1); $t .= "\n" unless $t =~ /\n\z/;
+                            print $all $t; print $code $t unless $md; $new--; }
+        elsif ($c eq "-") { $old--; }
+        elsif ($c eq " " || $l eq "\n") { $old--; $new--; }
+        elsif ($c eq "\\") { }
+        else  { die "unparseable line inside a hunk\n"; }
+        die "hunk longer than its header\n" if $old < 0 || $new < 0;
+        next;
+      }
+      if ($l =~ /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/) { $old = $1 // 1; $new = $2 // 1; next; }
+      if ($l =~ /^@@@/) { die "combined diff not supported\n"; }
+      if ($l =~ /^\+\+\+ (.*?)\t?\r?\n?\z/s) { $md = ($1 =~ /\.md"?\z/) ? 1 : 0; next; }
+      if ($l =~ /^[+-]/ && $l !~ /^--- /) { die "diff line outside a hunk\n"; }
+    }
+    die "truncated hunk\n" if $old > 0 || $new > 0;
+    close $all or die "close: $!\n"; close $code or die "close: $!\n";
+  ' "$1" "$2" <"$3" 2>"$TMP/parse.err" || die "could not parse the diff: $(cat "$TMP/parse.err")"
 }
-case "$MODE" in
-  staged) gl "staged changes" git --pre-commit --staged . ;;
-  range)
-    gl "commits in $RANGE" git --log-opts="--full-history $RANGE" .
-    # merge commits: compare each merge with every parent so merge-resolution content is scanned too
-    git log -m -p --text --full-history --merges --format='commit %H' "$RANGE" >"$TMP/merges.patch"
-    if [ -s "$TMP/merges.patch" ]; then gl "merge resolutions in $RANGE" stdin <"$TMP/merges.patch"; fi
-    ;;
-  tree) gl "files in $DIR" dir "$DIR" ;;
-esac
 
-# ---- collect file names (NUL-separated, never re-split) and added lines -------------------------
-: >"$TMP/files"; : >"$TMP/diff"
+# ---- 1. collect file names, added lines and the text to scan for secrets ---------------------------------
+: >"$TMP/files"; : >"$TMP/secret_input"; : >"$TMP/added"
 case "$MODE" in
   staged)
-    git diff --cached --name-only -z --diff-filter=ACMRT >"$TMP/files"
-    git diff --cached --text -U0 --diff-filter=ACMRT -- . ':(exclude)*.md' >"$TMP/diff"
+    "${G[@]}" diff --cached --name-only -z --diff-filter=ACMRT >"$TMP/files"
+    "${G[@]}" diff --cached "${DIFF[@]}" --diff-filter=ACMRT >"$TMP/patch"
+    parse_patch "$TMP/secret_input" "$TMP/added" "$TMP/patch"
     ;;
   range)
-    git log -m --full-history --name-only -z --format= --diff-filter=ACMRT "$RANGE" >"$TMP/files"
-    { git log -m -p --text --full-history --format= --diff-filter=ACMRT "$RANGE" -- . ':(exclude)*.md'
-      git diff --text -U0 --diff-filter=ACMRT "$MB" "$HEAD_REF" -- . ':(exclude)*.md'; } >"$TMP/diff"
+    "${G[@]}" log -m --full-history --name-only -z --format= --diff-filter=ACMRT "$RANGE" >"$TMP/files"
+    # every commit in the range (merges against each parent), then the net change from the merge base
+    "${G[@]}" log -m -p --full-history "${DIFF[@]}" --format='commit %H' --diff-filter=ACMRT "$RANGE" >"$TMP/patch"
+    "${G[@]}" diff "${DIFF[@]}" --diff-filter=ACMRT "$MB" "$HEAD_REF" >>"$TMP/patch"
+    parse_patch "$TMP/secret_input" "$TMP/added" "$TMP/patch"
     ;;
   tree)
     (cd "$DIR" && find . \( -type f -o -type l \) -not -path './.git/*' -print0) >"$TMP/files"
     : >"$TMP/links"
-    while IFS= read -r -d '' f; do [ -L "$DIR/$f" ] && printf '%s\n' "$f" >>"$TMP/links"; done <"$TMP/files"
-    [ -s "$TMP/links" ] && { block "symlinks are not allowed in a deploy payload (their targets are not scanned):"; sed 's/^/    /' "$TMP/links" >&2; }
     while IFS= read -r -d '' f; do
-      [ -L "$DIR/$f" ] && continue
-      case "$f" in *.md) continue ;; esac
+      if [ -L "$DIR/$f" ]; then printf '%s\n' "$f" >>"$TMP/links"; continue; fi
       [ -r "$DIR/$f" ] || die "cannot read $f"
-      sed 's/^/+/' "$DIR/$f" >>"$TMP/diff" || die "cannot read $f"
+      cat -- "$DIR/$f" >>"$TMP/secret_input" || die "cannot read $f"
+      printf '\n' >>"$TMP/secret_input"
+      case "$f" in
+        *.md) ;;
+        *) cat -- "$DIR/$f" >>"$TMP/added" || die "cannot read $f"; printf '\n' >>"$TMP/added" ;;
+      esac
     done <"$TMP/files"
+    if [ -s "$TMP/links" ]; then block "symlinks are not allowed in a deploy payload (their targets are not scanned):"; sed 's/^/    /' "$TMP/links" >&2; fi
     ;;
 esac
-# added lines: every line starting with "+" except the "+++ b/path" / "+++ /dev/null" file headers
-rc=0; grep -aE '^\+' "$TMP/diff" >"$TMP/plus" || rc=$?; [ $rc -le 1 ] || die "reading the diff failed"
-rc=0; grep -avE '^\+\+\+ (b/|/dev/null|"b/)' "$TMP/plus" >"$TMP/added" || rc=$?; [ $rc -le 1 ] || die "reading the diff failed"
+
+# ---- 2. secrets: gitleaks with a fixed policy, stdin only -------------------------------------------
+# Built-in rules only; the scanned repository's .gitleaks.toml, .gitleaksignore and inline
+# "gitleaks:allow" comments are ignored, and stdin input carries no file path, so the default policy's
+# path exclusions (lockfiles, images, vendored code, ...) cannot hide anything. Findings use exit code 3
+# so they cannot be confused with errors.
+printf '[extend]\nuseDefault = true\n' >"$TMP/gitleaks.toml"
+mkdir -p "$TMP/noignore"
+rc=0
+"$GITLEAKS" stdin --config "$TMP/gitleaks.toml" --gitleaks-ignore-path "$TMP/noignore" --ignore-gitleaks-allow \
+  --redact --no-banner --exit-code 3 --log-level warn <"$TMP/secret_input" >"$TMP/gl.out" 2>&1 || rc=$?
+if [ $rc -eq 3 ]; then cat "$TMP/gl.out" >&2; block "secrets detected"
+elif [ $rc -ne 0 ]; then cat "$TMP/gl.out" >&2; die "gitleaks failed (exit $rc)"
+elif grepq -aiE '(^|[[:space:]])(ERR|ERROR|FTL|FATAL)([[:space:]]|$)|level=(error|fatal)|(WRN|WARN).*(fail|error|unable|skip|could not|cannot)' "$TMP/gl.out"; then
+  cat "$TMP/gl.out" >&2; die "gitleaks reported errors but exited 0: treating the scan as incomplete"
+fi
 
 # helper: run a regex test on every file name, NUL-safe (names may contain spaces, newlines, Japanese)
 names_matching() {  # names_matching <ERE> <outfile>: case-insensitive, in-process (no pipeline to hide errors)
@@ -130,11 +168,11 @@ names_matching() {  # names_matching <ERE> <outfile>: case-insensitive, in-proce
 }
 show_names() { tr '\0' '\n' <"$1" | sort -u | sed 's/^/    /' >&2; }
 
-# ---- 2. credential / key files by name ---------------------------------------------------------------
+# ---- 3. credential / key files by name ---------------------------------------------------------------
 names_matching '(firebase-adminsdk-.*\.json|service[-_]?account.*\.json|gha-creds-.*\.json|\.pem$|\.p12$|\.pfx$|\.key$|(^|/)id_(rsa|ed25519|ecdsa)$|credentials\.json$)' "$TMP/cred"
-[ -s "$TMP/cred" ] && { block "credential/key files must never be committed or deployed:"; show_names "$TMP/cred"; }
+if [ -s "$TMP/cred" ]; then block "credential/key files must never be committed or deployed:"; show_names "$TMP/cred"; fi
 
-# ---- 3. .env files with secret-like values: every version, each checked on its own ------------------
+# ---- 4. .env files with secret-like values: every version, each checked on its own ------------------
 ENV_SECRET_RE='^[[:space:]]*(export[[:space:]]+)?[A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|CREDS|CREDENTIAL|API_KEY|APIKEY|CLIENT_SECRET)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]'
 names_matching '(^|/)\.env([.][A-Za-z0-9_.-]+)?$' "$TMP/envs"
 n=0
@@ -157,14 +195,18 @@ for ((i = 1; i <= n; i++)); do
   if grepq -aiE "$ENV_SECRET_RE" "$TMP/env.$i"; then block ".env file with secret-like values (use a secret manager; commit only .env.example):"; show_names "$TMP/envs"; break; fi
 done
 
-# ---- 4. client data files ----------------------------------------------------------------------------
+# ---- 5. client data files; archives in a deploy payload -----------------------------------------------
 names_matching '\.(xlsx|xlsm|xls|csv|tsv|parquet|sqlite|db|dump|bak)$' "$TMP/data"
 if [ -s "$TMP/data" ]; then
   if [ "${SCAN_ALLOW_DATA_FILES:-false}" = true ]; then warn "data files present (allowed by SCAN_ALLOW_DATA_FILES):"; show_names "$TMP/data"
   else block "client data files must not go into git or deploy packages:"; show_names "$TMP/data"; fi
 fi
+if [ "$MODE" = tree ]; then
+  names_matching '\.(zip|tar|tgz|gz|bz2|xz|zst|7z|rar|jar|war|whl|egg)$' "$TMP/archives"
+  if [ -s "$TMP/archives" ]; then block "archives are not allowed in a deploy payload (their contents are not scanned):"; show_names "$TMP/archives"; fi
+fi
 
-# ---- 5. risky code patterns in added lines -------------------------------------------------------------
+# ---- 6. risky code patterns in added lines -------------------------------------------------------------
 check() { if grepq -aE -- "$2" "$TMP/added"; then block "$1"; fi; }
 check "private key material"                                  'BEGIN (RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY'
 check "Microsoft Entra client secret"                         '[A-Za-z0-9_.~-]{3}[0-9]Q~[A-Za-z0-9_.~-]{30,}'

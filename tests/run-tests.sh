@@ -2,15 +2,18 @@
 # Tests for security-scan.sh. Builds throwaway repositories and checks exit codes:
 # 0 clean, 1 blocked, 2 scanner error. Fixture commits are created with git plumbing
 # (write-tree / commit-tree), which never runs hooks.
-set -uo pipefail
+# Fixture setup fails fast: any error outside a scanner run aborts the whole suite (exit 2),
+# so a broken fixture can never be counted as a passing regression test.
+set -Eeuo pipefail
+trap 'echo "TEST SETUP FAILED at line $LINENO" >&2; exit 2' ERR
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 SCAN="$HERE/security-scan.sh"
 pass=0; failn=0
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/scan-tests.XXXXXX"); trap 'rm -rf "$WORK"' EXIT
 
 expect() {  # expect <code> <label> <command...>
-  local want=$1 label=$2; shift 2
-  "$@" >/dev/null 2>&1; local got=$?
+  local want=$1 label=$2 got=0; shift 2
+  "$@" >/dev/null 2>&1 || got=$?
   if [ "$got" -eq "$want" ]; then pass=$((pass+1)); echo "PASS  $label"; else failn=$((failn+1)); echo "FAIL  $label (got $got, want $want)"; fi
 }
 
@@ -175,4 +178,67 @@ if [ "$(id -u)" != 0 ]; then
 fi
 expect 2 "tree: missing directory argument" "$SCAN" tree
 
-echo; echo "$pass passed, $failn failed"; [ "$failn" -eq 0 ]
+# ---------------- v3 regression tests (Codex review of v2) ----------------
+slug() { printf '%s' "$1" | tr '/.' '__'; }
+
+# P1-1: provider secrets in paths that gitleaks' default policy excludes are still found
+for p in logo.svg package-lock.json node_modules/lib/index.js vendor/x/y.go gitleaks.toml; do
+  D=$(newrepo "excl-$(slug "$p")"); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+  put "$D" "$p" "token = \"$TOKEN\""; commit "$D" add
+  expect 1 "range: provider token in default-excluded path $p" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+  T="$WORK/tree-excl-$(slug "$p")"; mkdir -p "$(dirname "$T/$p")"; printf 'token = "%s"\n' "$TOKEN" >"$T/$p"
+  expect 1 "tree: provider token in default-excluded path $p" "$SCAN" tree "$T"
+done
+
+# P1-2: provider secrets in binary-marked or binary files, including added-then-removed
+D=$(newrepo bin-attr); put "$D" .gitattributes '*.cfg -diff'; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" deploy.cfg "token = \"$TOKEN\""; commit "$D" add
+expect 1 "range: provider token in a -diff file" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(newrepo bin-removed); put "$D" .gitattributes '*.cfg binary'; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" deploy.cfg "token = \"$TOKEN\""; commit "$D" add; put "$D" deploy.cfg 'x = 1'; commit "$D" remove
+expect 1 "range: provider token added then removed in a binary-marked file" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+D=$(newrepo bin-staged); put "$D" .gitattributes '*.cfg -diff'; commit "$D" init
+put "$D" deploy.cfg "token = \"$TOKEN\""
+expect 1 "staged: provider token in a -diff file" bash -c "cd '$D' && '$SCAN' staged"
+D=$(newrepo bin-nul); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+printf 'BIN\000\001\002token = "%s"\000\n' "$TOKEN" >"$D/blob.dat"; git -C "$D" add blob.dat; commit "$D" add
+expect 1 "range: provider token inside a file with NUL bytes" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+T="$WORK/tree-nul"; mkdir -p "$T"; printf 'BIN\000\001token = "%s"\000\n' "$TOKEN" >"$T/blob.dat"
+expect 1 "tree: provider token inside a file with NUL bytes" "$SCAN" tree "$T"
+
+# P1-3: a failing git or gitleaks child is an error even after partial output
+REALGIT=$(command -v git)
+mkdir -p "$FAKE/git-log-fails" "$FAKE/git-diff-fails" "$FAKE/git-truncated"
+printf '#!/bin/sh\n"%s" "$@"; rc=$?\ncase " $* " in *" log "*) exit 1 ;; esac\nexit $rc\n' "$REALGIT" >"$FAKE/git-log-fails/git"
+printf '#!/bin/sh\n"%s" "$@"; rc=$?\ncase " $* " in *" diff "*) exit 141 ;; esac\nexit $rc\n' "$REALGIT" >"$FAKE/git-diff-fails/git"
+printf '#!/bin/sh\ncase " $* " in *" diff "*--cached*-U0*) printf "diff --git a/x b/x\\n--- a/x\\n+++ b/x\\n@@ -0,0 +1,5 @@\\n+partial\\n"; exit 0 ;; esac\nexec "%s" "$@"\n' "$REALGIT" >"$FAKE/git-truncated/git"
+chmod +x "$FAKE"/git-*/git
+expect 2 "git log fails after writing output -> error" bash -c "cd '$R' && PATH='$FAKE/git-log-fails':\$PATH '$SCAN' range $BASE HEAD"
+D=$(newrepo gitfail-staged); put "$D" README.txt base; commit "$D" init; put "$D" ok.py 'x = 1'
+expect 2 "git diff killed (SIGPIPE-style exit) -> error" bash -c "cd '$D' && PATH='$FAKE/git-diff-fails':\$PATH '$SCAN' staged"
+expect 2 "truncated diff from git -> error, never clean" bash -c "cd '$D' && PATH='$FAKE/git-truncated':\$PATH '$SCAN' staged"
+printf '#!/bin/sh\necho "partial output"\nkill -9 $$\n' >"$FAKE/gitleaks-killed"; chmod +x "$FAKE/gitleaks-killed"
+expect 2 "gitleaks killed by a signal -> error" bash -c "cd '$R' && GITLEAKS='$FAKE/gitleaks-killed' '$SCAN' range $BASE HEAD"
+
+# P2-4: content that looks like a patch header is still checked (range and tree)
+D=$(newrepo headerlike); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" app.js '++ b/ blob.make_public();'; commit "$D" add
+expect 1 "diff: content that becomes '+++ b/' after the diff marker is still checked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+T="$WORK/tree-headerlike"; mkdir -p "$T"; printf '%s\n' '++ b/ blob.make_public();' >"$T/app.js"
+expect 1 "tree: file content that looks like a patch header is still checked" "$SCAN" tree "$T"
+
+# only added lines count: removing an old secret is not blocked
+D=$(newrepo removal); put "$D" config.txt "token = \"$TOKEN\""; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
+put "$D" config.txt 'x = 1'; commit "$D" fix
+expect 0 "range: removing an existing secret is not blocked" bash -c "cd '$D' && '$SCAN' range $B HEAD"
+
+# deploy payload: archives are blocked (contents are not unpacked)
+T="$WORK/tree-archive"; mkdir -p "$T"; echo ok >"$T/main.py"; printf 'PK\003\004' >"$T/bundle.zip"
+expect 1 "tree: archive in a deploy payload is blocked" "$SCAN" tree "$T"
+
+# must run from the repository root
+mkdir -p "$R/sub"
+expect 2 "error: run from a subdirectory" bash -c "cd '$R/sub' && '$SCAN' range $BASE HEAD"
+
+echo; echo "$pass passed, $failn failed"
+exit $(( failn > 0 ? 1 : 0 ))
