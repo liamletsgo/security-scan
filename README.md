@@ -153,11 +153,16 @@ manifest profile (CI job "firebase helpers").
 ## Reusable deploy workflow (`.github/workflows/firebase-deploy.yml`)
 
 A Firebase Functions (Python) backend calls it with
-`uses: liamletsgo/security-scan/.github/workflows/firebase-deploy.yml@main` and its own settings (project,
-environment file, function name, tests). Jobs: scan (range scan + tests, read-only) → discover (runs the app once on
-a throwaway copy, no cloud access) → build (manifest check, exact payload, tree scan, read-only) → deploy (the only
-job that can request a Google token; runs no repository code or Python; branch-tip check; deploys the checked
-payload; containment check). Tools are taken from this repository's protected `main`.
+`uses: liamletsgo/security-scan/.github/workflows/firebase-deploy.yml@main`, passing only the environment chosen for a
+manual run and the baseline. Every policy decision is made inside the workflow: each calling repository has a fixed
+profile here (target projects, environment files, function, region, tests, reviewed manifest path, runtime account),
+and the event, branch and actor decide whether and where to deploy (production only by a manual run on `main`). One
+tools commit is resolved per run and used by every job; the run summary records it with the target and payload hash.
+Jobs: plan → scan (range scan + mandatory tests) → discover (runs the app once on a throwaway copy, no cloud access) →
+build (manifest checked against the committed reviewed copy and the profile's runtime account; exact payload; tree
+scan) → deploy (the only job that can request a Google token; runs no repository code or Python; branch-tip check;
+containment check). A baseline is the owner's statement of the last deployed commit; an empty range still gets the
+full payload scan. A red run after the deploy step means the new version may be live: read the run summary.
 
 Bind deploy credentials to it in each project's Workload Identity provider condition, for example:
 

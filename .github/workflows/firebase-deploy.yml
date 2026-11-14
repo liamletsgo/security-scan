@@ -8,58 +8,34 @@ name: firebase-deploy (reusable)
 # so Google issues deploy credentials only to this reviewed workflow from this repository's protected main,
 # whatever the calling repository's own workflow says. Tools come from the same protected main.
 #
-# Jobs: scan (range scan + tests; read-only) → discover (runs the app once on a throwaway copy, no cloud access) →
-# build (manifest check, exact payload, tree scan; read-only) → deploy (the only job that can request a Google
-# token; runs no repository code or Python; branch-tip check; deploys the checked payload; containment check).
+# Every policy decision is made here, not by the caller: the calling repository selects a fixed profile (target
+# projects, environment files, function, region, tests, reviewed manifest, runtime account); the event, branch and
+# actor decide whether and where to deploy. The caller only passes the environment chosen for a manual run and the
+# baseline. One tools commit is resolved per run and used by every job.
+#
+# Jobs: plan (profile, target, tools commit; no permissions) → scan (range scan + tests; read-only) → discover (runs
+# the app once on a throwaway copy, no cloud access) → build (manifest check, exact payload, tree scan; read-only) →
+# deploy (the only job that can request a Google token; runs no repository code or Python; branch-tip check; deploys
+# the checked payload; containment check).
 
 on:
   workflow_call:
     inputs:
-      deploy:
-        description: 'Run discover/build/deploy after the scan'
-        type: boolean
-        default: false
       environment:
-        type: string
-        default: ''
-      project_id:
-        type: string
-        default: ''
-      project_number:
-        type: string
-        default: ''
-      env_file:
-        description: 'Environment file copied to .env for the deploy (e.g. .env.dev)'
+        description: 'Environment chosen for a manual run (dev, demo or prod); ignored for pushes and pull requests'
         type: string
         default: ''
       baseline:
-        description: 'Reviewed baseline commit for manual runs'
+        description: 'Reviewed baseline commit for manual runs (the last deployed commit)'
         type: string
         default: ''
-      region:
-        type: string
-        default: asia-northeast1
-      function_name:
-        type: string
-        default: ''
-      containment_path:
-        description: 'Path for the anonymous request in the containment check'
-        type: string
-        default: /
-      reviewed_manifest:
-        type: string
-        default: .github/functions.manifest.yaml
-      test_command:
-        description: 'Unit tests to run after installing requirements.txt (empty: none)'
-        type: string
-        default: ''
-      python_version:
-        type: string
-        default: '3.13'
     outputs:
       deployed:
-        description: 'true when the deploy job completed'
+        description: 'true when the deploy step completed (containment may still have failed after it)'
         value: ${{ jobs.deploy.outputs.deployed }}
+      environment:
+        description: 'The environment this run targeted'
+        value: ${{ jobs.plan.outputs.environment }}
 
 permissions: {}
 
@@ -67,12 +43,75 @@ env:
   GITLEAKS_ASSET: gitleaks_8.30.1_linux_x64.tar.gz
   GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
   TOOLS_REPO: liamletsgo/security-scan
-  TOOLS_REF: main
   FIREBASE_TOOLS_VERSION: 15.18.0
 
 jobs:
+  plan:
+    name: plan (profile, target, tools commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      deploy: ${{ steps.p.outputs.deploy }}
+      environment: ${{ steps.p.outputs.environment }}
+      project_id: ${{ steps.p.outputs.project_id }}
+      project_number: ${{ steps.p.outputs.project_number }}
+      env_file: ${{ steps.p.outputs.env_file }}
+      function_name: ${{ steps.p.outputs.function_name }}
+      region: ${{ steps.p.outputs.region }}
+      containment_path: ${{ steps.p.outputs.containment_path }}
+      runtime_account: ${{ steps.p.outputs.runtime_account }}
+      tools_sha: ${{ steps.p.outputs.tools_sha }}
+    steps:
+      - id: p
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref }}
+          CHOSEN: ${{ inputs.environment }}
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          set -euo pipefail
+          # Profiles: one per calling repository. Only these repositories can use this workflow to deploy.
+          case "$GITHUB_REPOSITORY" in
+            liamletsgo/data_processing_tool)
+              OWNER=liamletsgo; DEV_BRANCH=refs/heads/Mar2025; PROD_BRANCH=refs/heads/main
+              FUNCTION=data_processing_tool; REGION=asia-northeast1; CONTAINMENT=/process-input-data
+              RUNTIME=pmj-backend@
+              target() { case "$1" in
+                dev)  echo "stellar-acre-448611-r9 41761197317" ;;
+                demo) echo "fir-environment-c5f0b 1064462544150" ;;
+                prod) echo "live2-excel-automation-project 570107665555" ;;
+                *) return 1 ;; esac; } ;;
+            *) echo "::error::$GITHUB_REPOSITORY has no deploy profile in this workflow"; exit 1 ;;
+          esac
+          deploy=false; envname=dev
+          if [ "$ACTOR" = "$OWNER" ]; then
+            if [ "$EVENT" = workflow_dispatch ]; then deploy=true; envname=$CHOSEN
+            elif [ "$EVENT" = push ] && [ "$REF" = "$DEV_BRANCH" ]; then deploy=true; envname=dev; fi
+          fi
+          read -r PROJECT_ID PROJECT_NUMBER < <(target "$envname") || { echo "::error::unknown environment '$envname'"; exit 1; }
+          if [ "$deploy" = true ] && [ "$envname" = prod ]; then
+            [ "$EVENT" = workflow_dispatch ] && [ "$REF" = "$PROD_BRANCH" ] || { echo "::error::production deploys only by a manual run on ${PROD_BRANCH#refs/heads/}"; exit 1; }
+          fi
+          TOOLS_SHA=$(git ls-remote "https://github.com/$TOOLS_REPO" refs/heads/main | cut -f1)
+          [[ "$TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve the tools commit"; exit 1; }
+          {
+            echo "deploy=$deploy"; echo "environment=$envname"; echo "project_id=$PROJECT_ID"; echo "project_number=$PROJECT_NUMBER"
+            echo "env_file=.env.$envname"; echo "function_name=$FUNCTION"; echo "region=$REGION"
+            echo "containment_path=$CONTAINMENT"; echo "runtime_account=$RUNTIME"; echo "tools_sha=$TOOLS_SHA"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Plan"
+            echo "| | |"; echo "|---|---|"
+            echo "| Deploy | $deploy |"; echo "| Environment | $envname ($PROJECT_ID) |"
+            echo "| Commit | \`$GITHUB_SHA\` on \`${REF#refs/heads/}\` by $ACTOR ($EVENT) |"
+            echo "| Baseline | \`${BASELINE:-none}\` |"; echo "| Tools | \`$TOOLS_SHA\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   scan:
     name: security scan and tests
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -88,7 +127,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           repository: ${{ env.TOOLS_REPO }}
-          ref: ${{ env.TOOLS_REF }}
+          ref: ${{ needs.plan.outputs.tools_sha }}
           path: .security-tools
           persist-credentials: false
 
@@ -137,24 +176,23 @@ jobs:
         run: bash "$RUNNER_TEMP/tools/security-scan.sh" range "$BASE" "$HEAD"
 
       - name: Setup Python
-        if: inputs.test_command != ''
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
-          python-version: ${{ inputs.python_version }}
+          python-version: '3.13'
 
-      - name: Unit tests
-        if: inputs.test_command != ''
-        env:
-          TEST_COMMAND: ${{ inputs.test_command }}
+      - name: Unit tests (fixed by the profile)
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check -q --only-binary=:all: --require-hashes -r requirements.txt
-          bash -c "$TEST_COMMAND"
+          case "$GITHUB_REPOSITORY" in
+            liamletsgo/data_processing_tool) python -m pytest -q test_internal_auth.py test_main_routes.py test_downstream_scope.py ;;
+            *) echo "::error::no test profile"; exit 1 ;;
+          esac
 
   discover:
     name: functions manifest (runs the app, no cloud access)
-    needs: scan
-    if: inputs.deploy
+    needs: [plan, scan]
+    if: needs.plan.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -169,14 +207,14 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           repository: ${{ env.TOOLS_REPO }}
-          ref: ${{ env.TOOLS_REF }}
+          ref: ${{ needs.plan.outputs.tools_sha }}
           path: .security-tools
           persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
-          python-version: ${{ inputs.python_version }}
+          python-version: '3.13'
 
       - name: Generate the manifest on a throwaway copy
         run: |
@@ -199,7 +237,7 @@ jobs:
 
   build:
     name: build and scan the deploy payload
-    needs: discover
+    needs: [plan, discover]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -216,7 +254,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           repository: ${{ env.TOOLS_REPO }}
-          ref: ${{ env.TOOLS_REF }}
+          ref: ${{ needs.plan.outputs.tools_sha }}
           path: .security-tools
           persist-credentials: false
 
@@ -244,14 +282,25 @@ jobs:
 
       - name: Check the manifest, select the environment file, assemble and scan the payload
         env:
-          REVIEWED: ${{ inputs.reviewed_manifest }}
-          ENV_FILE: ${{ inputs.env_file }}
+          ENV_FILE: ${{ needs.plan.outputs.env_file }}
+          RUNTIME_ACCOUNT: ${{ needs.plan.outputs.runtime_account }}
         run: |
           set -euo pipefail
           FT="$RUNNER_TEMP/tools/firebase/node_modules/firebase-tools"
+          REVIEWED=.github/functions.manifest.yaml
+          git ls-files --error-unmatch "$REVIEWED" >/dev/null
+          [ -f "$REVIEWED" ] && [ ! -L "$REVIEWED" ] || { echo "::error::$REVIEWED must be a committed regular file"; exit 1; }
           node "$RUNNER_TEMP/tools/firebase/manifest-check.js" "$FT" "$RUNNER_TEMP/manifest/functions.yaml" "$REVIEWED"
+          # shellcheck disable=SC2016  # JavaScript source, not shell
+          node -e '
+            const yaml = require(require.resolve("yaml", { paths: [process.argv[1]] }));
+            const m = yaml.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+            for (const [n, ep] of Object.entries(m.endpoints)) if (ep.serviceAccountEmail !== process.argv[3]) {
+              console.error(`${n}: runtime account must be ${process.argv[3]}`); process.exit(2); }
+          ' "$FT" "$RUNNER_TEMP/manifest/functions.yaml" "$RUNTIME_ACCOUNT"
           cp "$RUNNER_TEMP/manifest/functions.yaml" functions.yaml
-          [[ "$ENV_FILE" =~ ^\.env\.[a-z0-9]+$ ]] || { echo "::error::env_file must look like .env.<name>"; exit 1; }
+          git ls-files --error-unmatch "$ENV_FILE" >/dev/null
+          [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] || { echo "::error::$ENV_FILE must be a committed regular file"; exit 1; }
           mv .env .env1
           cp "$ENV_FILE" .env
           node "$RUNNER_TEMP/tools/firebase/payload.js" "$FT" "$FIREBASE_TOOLS_VERSION" . "$RUNNER_TEMP/payload"
@@ -276,29 +325,29 @@ jobs:
 
   deploy:
     name: deploy
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read    # branch-tip check only
       id-token: write   # the only job that can request a Google token
     concurrency:
-      group: firebase-deploy-${{ github.repository }}-${{ inputs.environment }}
+      group: firebase-deploy-${{ github.repository }}-${{ needs.plan.outputs.environment }}
       cancel-in-progress: false
     outputs:
       deployed: ${{ steps.deploy.outcome == 'success' }}
     env:
       PAYLOAD_SHA256: ${{ needs.build.outputs.payload_sha256 }}
-      PROJECT_ID: ${{ inputs.project_id }}
-      REGION: ${{ inputs.region }}
-      FUNCTION: ${{ inputs.function_name }}
-      CONTAINMENT_PATH: ${{ inputs.containment_path }}
+      PROJECT_ID: ${{ needs.plan.outputs.project_id }}
+      REGION: ${{ needs.plan.outputs.region }}
+      FUNCTION: ${{ needs.plan.outputs.function_name }}
+      CONTAINMENT_PATH: ${{ needs.plan.outputs.containment_path }}
     steps:
       - name: Checkout the reviewed tools
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           repository: ${{ env.TOOLS_REPO }}
-          ref: ${{ env.TOOLS_REF }}
+          ref: ${{ needs.plan.outputs.tools_sha }}
           path: tools
           persist-credentials: false
 
@@ -339,8 +388,8 @@ jobs:
         id: auth
         uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
         with:
-          workload_identity_provider: projects/${{ inputs.project_number }}/locations/global/workloadIdentityPools/github/providers/github-oidc
-          service_account: github-deployer@${{ inputs.project_id }}.iam.gserviceaccount.com
+          workload_identity_provider: projects/${{ needs.plan.outputs.project_number }}/locations/global/workloadIdentityPools/github/providers/github-oidc
+          service_account: github-deployer@${{ needs.plan.outputs.project_id }}.iam.gserviceaccount.com
 
       - name: Deploy (Firebase reads functions.yaml; the app is not run here)
         id: deploy
@@ -357,3 +406,20 @@ jobs:
       - name: Containment checks (fails if the function is public)
         if: always() && steps.auth.outcome == 'success'
         run: bash "$RUNNER_TEMP/tools/firebase/containment.sh" "$FUNCTION" "$REGION" "$PROJECT_ID" "$CONTAINMENT_PATH"
+
+      - name: Run summary
+        if: always()
+        env:
+          AUTH: ${{ steps.auth.outcome }}
+          DEPLOY: ${{ steps.deploy.outcome }}
+        run: |
+          {
+            echo "### Deploy"
+            echo "| | |"; echo "|---|---|"
+            echo "| Target | $FUNCTION in $PROJECT_ID ($REGION) |"
+            echo "| Payload sha256 | \`$PAYLOAD_SHA256\` |"
+            echo "| Sign-in | $AUTH |"; echo "| Deploy step | $DEPLOY |"
+            echo ""
+            echo "If the deploy step succeeded but a later check failed, the new version **is live**: check the containment"
+            echo "result above and fix forward or redeploy the previous commit. If the branch moved during the run, start a new run."
+          } >> "$GITHUB_STEP_SUMMARY"
