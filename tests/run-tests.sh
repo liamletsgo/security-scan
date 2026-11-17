@@ -136,6 +136,10 @@ envcase "production.local name" .env.production.local 'API_KEY=abc' 1
 envcase "export and spaces" .env 'export  DB_PASSWORD = hunter2' 1
 envcase "example file ignored" .env.example 'API_KEY=placeholder' 0
 envcase "non-secret values pass" .env 'STORAGE_BUCKET=my-bucket' 0
+envcase "sample file is checked" .env.sample 'API_TOKEN=abc' 1
+envcase "template file is checked" .env.template 'DB_PASSWORD=abc' 1
+envcase "a value starting with # is a value" .env 'API_TOKEN=#abc' 1
+envcase "a comment after spaces is not a value" .env 'API_TOKEN= # set in the secret manager' 0
 D=$(newrepo env-history); put "$D" README.txt base; commit "$D" init; B=$(git -C "$D" rev-parse HEAD)
 put "$D" .env 'API_SECRET=abc'; commit "$D" add; put "$D" .env 'STORAGE_BUCKET=x'; commit "$D" fix
 expect 1 ".env: secret in an earlier version of the range is caught" bash -c "cd '$D' && '$SCAN' range $B HEAD"
@@ -454,6 +458,199 @@ D=$(envmerge v7-envmerge-secret 'API_SECRET=abc'); EB=$(git -C "$D" rev-list --m
 expect_msg 1 '\.env file with secret-like values' "env: secret introduced only by a merge's .env resolution" bash -c "cd '$D' && '$SCAN' range $EB HEAD"
 D=$(envmerge v7-envmerge-removed 'API_SECRET=abc'); EB=$(git -C "$D" rev-list --max-parents=0 HEAD); put "$D" .env 'STORAGE_BUCKET=fixed'; commit "$D" fix
 expect_msg 1 '\.env file with secret-like values' "env: merge-only .env secret later removed is still caught" bash -c "cd '$D' && '$SCAN' range $EB HEAD"
+
+# ---------------- v8: history and new modes, coverage, pattern report, exemption, old-commit guard ----------------
+# The caller-only options are refused under CI, so this section clears the CI indicators that GitHub
+# Actions sets; the refusal tests set them explicitly.
+unset GITHUB_ACTIONS CI
+# A syntactically valid commit id that names no object, assembled at run time (gitleaks would read a
+# literal 40-hex string as a token).
+FAKEID=$(printf '%s' 0123456789abcdef 0123456789abcdef 01234567)
+# Secret-shaped fixtures are assembled at run time so this file never contains them literally.
+PKM="-----BEGIN PRIV""ATE KEY-----"
+ENTRA="ab$(printf 'c')8Q~$(printf 'k%.0s' $(seq 1 34))"
+mkrepo() {  # mkrepo <name> <path> <content> [<path> <content>]...: one commit per pair; prints the repo path
+  local d; d=$(newrepo "$1"); shift
+  while [ $# -ge 2 ]; do put "$d" "$1" "$2"; commit "$d" "add $1"; shift 2; done
+  echo "$d"
+}
+sha256() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
+
+# history mode
+D=$(mkrepo v8-hist-clean README.txt base app.py "print('ok')")
+expect_msg 0 'scanned 2 commits \(history\)' "history: clean history passes and reports its coverage" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-hist-root storage.py 'blob.make_public()')
+expect 1 "history: the root commit's additions are scanned" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-hist-removed README.txt base app.py "token = '$TOKEN'" app.py "token = None")
+expect_msg 1 "$SECRET" "history: a secret added and later removed is caught" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-hist-ja README.txt base "顧客/在庫表.xlsx" x)
+git -C "$D" rm -q --cached -- "顧客/在庫表.xlsx"; commit "$D" "remove the data file"
+expect_msg 1 'client data files' "history: a Japanese-named data file in an old commit blocks" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(envmerge v8-hist-envmerge 'API_SECRET=abc')
+expect_msg 1 '\.env file with secret-like values' "history: a merge-only .env secret is caught" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-hist-args README.txt base)
+expect 2 "history: unknown head is an error" bash -c "cd '$D' && '$SCAN' history $FAKEID"
+expect 2 "history: data-file allowance is refused" bash -c "cd '$D' && SCAN_ALLOW_DATA_FILES=true '$SCAN' history HEAD"
+expect 2 "history: wrong argument count is an error" bash -c "cd '$D' && '$SCAN' history"
+
+# new mode: the caller lists the commits the destination has
+D=$(mkrepo v8-new storage.py 'blob.make_public()'); NB=$(git -C "$D" rev-parse HEAD)
+put "$D" app.py "print('ok')"; commit "$D" clean
+printf '%s\n' "$NB" >"$WORK/v8.has"
+expect_msg 0 'scanned 1 commits \(new\)' "new: commits the destination has are not scanned" bash -c "cd '$D' && '$SCAN' new HEAD '$WORK/v8.has'"
+put "$D" more.py 'blob.make_public()'; commit "$D" risky
+expect_msg 1 'public storage objects' "new: a risky new commit blocks" bash -c "cd '$D' && '$SCAN' new HEAD '$WORK/v8.has'"
+git -C "$D" rev-parse HEAD >"$WORK/v8.has2"
+expect_msg 0 'scanned 0 commits \(new\)' "new: nothing new is clean" bash -c "cd '$D' && '$SCAN' new HEAD '$WORK/v8.has2'"
+printf '%s\n' "$FAKEID" >"$WORK/v8.has3"
+expect_msg 1 'scanned 3 commits \(new\).*public storage objects' "new: ids missing locally only widen the scan" bash -c "cd '$D' && '$SCAN' new HEAD '$WORK/v8.has3' 2>&1 | tr '\n' ' '; exit \${PIPESTATUS[0]}"
+: >"$WORK/v8.has4"
+expect_msg 1 'scanned 3 commits \(new\)' "new: an empty list scans everything" bash -c "cd '$D' && '$SCAN' new HEAD '$WORK/v8.has4' 2>&1 | tr '\n' ' '; exit \${PIPESTATUS[0]}"
+printf 'origin/main\n' >"$WORK/v8.has5"
+expect 2 "new: a list entry that is not a full commit id is an error" bash -c "cd '$D' && '$SCAN' new HEAD '$WORK/v8.has5'"
+expect 2 "new: a missing list is an error" bash -c "cd '$D' && '$SCAN' new HEAD '$WORK/none'"
+R2=$(rangerepo v8-range-count); put "$R2" app.py "print('ok')"; commit "$R2" one; RB=$(git -C "$R2" rev-list --max-parents=0 HEAD)
+expect_msg 0 'scanned 1 commits \(range\)' "range: reports its coverage" bash -c "cd '$R2' && '$SCAN' range $RB HEAD"
+
+# pattern report (history mode only, never under CI)
+D=$(mkrepo v8-report storage.py 'blob.make_public()' rules/firestore.rules "$(printf 'allow read,\n  write: if true;')" other.py 'a.make_public(); b.make_public()')
+C1=$(git -C "$D" rev-list --reverse HEAD | sed -n 1p); C3=$(git -C "$D" rev-parse HEAD)
+expect 0 "report: code patterns are reported, not blocked" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.report' '$SCAN' history HEAD"
+H1=$(sha256 'make_public(')
+expect 0 "report: commit, path, label and span hash are attributed" perl -MJSON::PP -e '
+  my ($f, $c, $h) = @ARGV; open(my $x, "<", $f) or exit 1; my $ok = 0;
+  while (<$x>) { my $j = decode_json($_); $ok = 1 if $j->{commit} eq $c && $j->{path} eq "storage.py"
+    && $j->{label} =~ /^public storage objects/ && $j->{span_sha256} eq $h && $j->{count} == 1 }
+  exit($ok ? 0 : 1)' "$WORK/v8.report" "$C1" "$H1"
+expect 0 "report: a multi-line match is reported once with its file" perl -MJSON::PP -e '
+  open(my $x, "<", shift) or exit 1; my $n = 0;
+  while (<$x>) { my $j = decode_json($_); $n++ if $j->{path} eq "rules/firestore.rules" && $j->{label} =~ /^open Firebase rules/ }
+  exit($n == 1 ? 0 : 1)' "$WORK/v8.report"
+expect 0 "report: repeated matches in one unit are counted" perl -MJSON::PP -e '
+  my ($f, $c) = @ARGV; open(my $x, "<", $f) or exit 1; my $ok = 0;
+  while (<$x>) { my $j = decode_json($_); $ok = 1 if $j->{commit} eq $c && $j->{path} eq "other.py" && $j->{count} == 2 }
+  exit($ok ? 0 : 1)' "$WORK/v8.report" "$C3"
+HML=$(sha256 "$(printf 'allow read,\n  write: if true')")
+expect 0 "report: a multi-line match carries the hash of its whole span" perl -MJSON::PP -e '
+  my ($f, $h) = @ARGV; open(my $x, "<", $f) or exit 1; my $ok = 0;
+  while (<$x>) { my $j = decode_json($_); $ok = 1 if $j->{path} eq "rules/firestore.rules" && $j->{span_sha256} eq $h }
+  exit($ok ? 0 : 1)' "$WORK/v8.report" "$HML"
+# merge parents: a merge that adds a risky file is reported once per parent, with that parent
+D=$(newrepo v8-report-merge); put "$D" README.txt base; commit "$D" base; MBASE=$(git -C "$D" rev-parse HEAD)
+put "$D" a.py 'a = 1'; commit "$D" left; ML=$(git -C "$D" rev-parse HEAD)
+git -C "$D" update-ref HEAD "$MBASE"; git -C "$D" read-tree "$MBASE"; put "$D" b.py 'b = 1'; commit "$D" right; MR=$(git -C "$D" rev-parse HEAD)
+git -C "$D" read-tree "$ML"; put "$D" b.py 'b = 1'; put "$D" m.py 'm.make_public()'
+MT=$(git -C "$D" write-tree); MM=$(git -C "$D" commit-tree "$MT" -p "$ML" -p "$MR" -m merge); git -C "$D" update-ref HEAD "$MM"; git -C "$D" read-tree "$MM"
+expect 0 "report: merge history scans without blocking in report mode" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.rm' '$SCAN' history HEAD"
+expect 0 "report: a merge's hit is attributed to each parent separately" perl -MJSON::PP -e '
+  my ($f, $m, $l, $r) = @ARGV; open(my $x, "<", $f) or exit 1; my %p;
+  while (<$x>) { my $j = decode_json($_); $p{$j->{parent}}++ if $j->{commit} eq $m && $j->{path} eq "m.py" }
+  exit(($p{$l} && $p{$r} && keys %p == 2) ? 0 : 1)' "$WORK/v8.rm" "$MM" "$ML" "$MR"
+# unusual path bytes round-trip exactly (git C-quotes tabs and quotes)
+UP=$'q/a"b\tc 顧客.py'
+D=$(newrepo v8-report-path); put "$D" README.txt base; commit "$D" base; put "$D" "$UP" 'x.make_public()'; commit "$D" odd
+expect 0 "report: an unusual path scans in report mode" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.rp' '$SCAN' history HEAD"
+expect 0 "report: path_hex holds the exact path bytes" perl -MJSON::PP -e '
+  my ($f, $p) = @ARGV; open(my $x, "<", $f) or exit 1; my $ok = 0;
+  while (<$x>) { my $j = decode_json($_); $ok = 1 if $j->{path_hex} eq unpack("H*", $p) }
+  exit($ok ? 0 : 1)' "$WORK/v8.rp" "$UP"
+# a merge whose tree equals its first parent: git omits that empty diff; the hit belongs to the second
+D=$(newrepo v8-merge-empty); put "$D" f.txt a; commit "$D" base; EB0=$(git -C "$D" rev-parse HEAD)
+put "$D" r.py 'r.make_public()'; commit "$D" left; EL=$(git -C "$D" rev-parse HEAD)
+git -C "$D" update-ref HEAD "$EB0"; git -C "$D" read-tree "$EB0"; put "$D" o.txt o; commit "$D" right; ER=$(git -C "$D" rev-parse HEAD)
+EM=$(git -C "$D" commit-tree "$(git -C "$D" rev-parse "$EL^{tree}")" -p "$EL" -p "$ER" -m merge); git -C "$D" update-ref HEAD "$EM"; git -C "$D" read-tree "$EM"
+expect 0 "report: a merge equal to its first parent scans in report mode" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.rme' '$SCAN' history HEAD"
+expect 0 "report: its hit is attributed to the second parent, not the first" perl -MJSON::PP -e '
+  my ($f, $m, $l, $r) = @ARGV; open(my $x, "<", $f) or exit 1; my %p;
+  while (<$x>) { my $j = decode_json($_); $p{$j->{parent}}++ if $j->{commit} eq $m }
+  exit(($p{$r} && !$p{$l}) ? 0 : 1)' "$WORK/v8.rme" "$EM" "$EL" "$ER"
+# Markdown: secret material blocks, prose about a PEM header does not
+KEYBODY=$(printf 'QUJDRA%.0s' $(seq 1 12))
+D=$(mkrepo v8-md-key README.txt base notes.md "$(printf '%s\n%s\n' "$PKM" "$KEYBODY")")
+expect_msg 1 'private key material|secrets detected' "markdown: a key header with a body blocks" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-md-key-escaped README.txt base notes.md "key: \"$PKM\\n$KEYBODY\\n\"")
+expect_msg 1 'private key material|secrets detected' "markdown: an escaped key body blocks" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-md-entra README.txt base notes.md "The old secret was $ENTRA in the app.")
+expect_msg 1 'Entra client secret|secrets detected' "markdown: an Entra secret value blocks" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-md-prose README.txt base notes.md "The review found the $PKM header named nine times, without a key.")
+expect_msg 0 'clean' "markdown: prose that names a PEM header passes" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-md-report storage.py 'blob.make_public()' notes.md "The old secret was $ENTRA.")
+expect_msg 1 'Entra client secret|secrets detected' "markdown: secret material blocks in report mode too" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.rmd' '$SCAN' history HEAD"
+# Markdown units are checked one by one: a header in one file and a digest in another never combine
+DIGEST=$(printf 'ab12cd34%.0s' $(seq 1 6))
+D=$(newrepo v9-md-split-files); put "$D" a.md "Rotate the key whose file starts $PKM"; put "$D" b.md "$DIGEST"; commit "$D" both
+expect_msg 0 'clean' "markdown: a header in one file and a digest in another (same commit) do not combine" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v9-md-split-commits a.md "Rotate the key whose file starts $PKM" a.md "$(printf 'Rotate the key whose file starts %s\n%s' "$PKM" "")" c.md "$DIGEST")
+expect_msg 0 'clean' "markdown: a header and a digest added in different commits do not combine" bash -c "cd '$D' && '$SCAN' history HEAD"
+T="$WORK/v9-md-tree"; mkdir -p "$T"; printf 'Rotate the key whose file starts %s\n' "$PKM" >"$T/a.md"; printf '%s\n' "$DIGEST" >"$T/b.md"
+expect_msg 0 'clean' "markdown: tree mode checks each file on its own" "$SCAN" tree "$T"
+printf '%s\n%s\n' "$PKM" "$KEYBODY" >"$T/c.md"
+expect_msg 1 'key body in Markdown' "markdown: tree mode still blocks a key in one file" "$SCAN" tree "$T"
+D=$(mkrepo v9-md-quoted README.txt base notes.md "$(printf '> %s\n> %s\n' "$PKM" "$KEYBODY")")
+expect_msg 1 'key body in Markdown|secrets detected' "markdown: a blockquoted key (truncated, no end line) blocks" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v9-md-crlf README.txt base notes.md "key: \"$PKM\\r\\n$KEYBODY\"")
+expect_msg 1 'key body in Markdown|secrets detected' "markdown: a key body after an escaped CRLF blocks" bash -c "cd '$D' && '$SCAN' history HEAD"
+D=$(mkrepo v8-report-pk storage.py 'blob.make_public()' k.txt "$PKM")
+expect_msg 1 'private key material' "report: private-key material still blocks" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.r2' '$SCAN' history HEAD"
+D=$(mkrepo v8-report-entra storage.py 'blob.make_public()' cfg.js "const s = '$ENTRA';")
+expect_msg 1 'Entra client secret' "report: an Entra secret still blocks" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.r3' '$SCAN' history HEAD"
+D=$(mkrepo v8-report-gl storage.py 'blob.make_public()' app.py "token = '$TOKEN'")
+expect_msg 1 "$SECRET" "report: gitleaks findings still block" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.r4' '$SCAN' history HEAD"
+D=$(mkrepo v8-report-key storage.py 'blob.make_public()' creds/service-account-x.json '{}')
+expect_msg 1 'credential/key files' "report: key files still block" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.r5' '$SCAN' history HEAD"
+D=$(mkrepo v8-report-data storage.py 'blob.make_public()' exports/a.csv 'x')
+expect_msg 1 'client data files' "report: data files still block" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.r6' '$SCAN' history HEAD"
+D=$(mkrepo v8-report-env storage.py 'blob.make_public()' .env 'API_KEY=abc')
+expect_msg 1 '\.env file with secret-like values' "report: .env secrets still block" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.r7' '$SCAN' history HEAD"
+D=$(mkrepo v8-report-modes README.txt base app.py "print('ok')"); DB=$(git -C "$D" rev-list --max-parents=0 HEAD)
+expect 2 "report: refused in range mode" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.r8' '$SCAN' range $DB HEAD"
+expect 2 "report: refused in staged mode" bash -c "cd '$D' && SCAN_PATTERN_REPORT='$WORK/v8.r8' '$SCAN' staged"
+expect 2 "report: refused in tree mode" bash -c "SCAN_PATTERN_REPORT='$WORK/v8.r8' '$SCAN' tree '$D'"
+expect 2 "report: refused under GitHub Actions" bash -c "cd '$D' && GITHUB_ACTIONS=true SCAN_PATTERN_REPORT='$WORK/v8.r8' '$SCAN' history HEAD"
+expect 2 "report: refused under CI" bash -c "cd '$D' && CI=true SCAN_PATTERN_REPORT='$WORK/v8.r8' '$SCAN' history HEAD"
+D=$(mkrepo v8-report-off storage.py 'blob.make_public()')
+expect_msg 1 'public storage objects' "history without a report blocks on code patterns" bash -c "cd '$D' && '$SCAN' history HEAD"
+
+# pattern exemption (exact paths; code patterns only; never under CI)
+printf '# test list\nscanner/rules.sh\n' >"$WORK/v8.exempt"
+D=$(newrepo v8-exempt); put "$D" README.txt base; commit "$D" init
+put "$D" scanner/rules.sh "check 'make_public\\s*\\(|allUsers'"
+expect 0 "exempt: an exempt path may contain code-pattern text" bash -c "cd '$D' && SCAN_PATTERN_EXEMPT_FILE='$WORK/v8.exempt' '$SCAN' staged"
+put "$D" app.py 'blob.make_public()'
+expect_msg 1 'public storage objects' "exempt: other paths are still checked" bash -c "cd '$D' && SCAN_PATTERN_EXEMPT_FILE='$WORK/v8.exempt' '$SCAN' staged"
+git -C "$D" rm -q --cached app.py
+put "$D" scanner/rules.sh "$PKM"
+expect_msg 1 'private key material' "exempt: secret material in an exempt path still blocks" bash -c "cd '$D' && SCAN_PATTERN_EXEMPT_FILE='$WORK/v8.exempt' '$SCAN' staged"
+expect 2 "exempt: refused under CI" bash -c "cd '$D' && CI=true SCAN_PATTERN_EXEMPT_FILE='$WORK/v8.exempt' '$SCAN' staged"
+expect 2 "exempt: a missing list is an error" bash -c "cd '$D' && SCAN_PATTERN_EXEMPT_FILE='$WORK/none' '$SCAN' staged"
+expect 2 "exempt: cannot be combined with a report" bash -c "cd '$D' && SCAN_PATTERN_EXEMPT_FILE='$WORK/v8.exempt' SCAN_PATTERN_REPORT='$WORK/v8.r9' '$SCAN' history HEAD"
+expect 2 "exempt: not supported in tree mode" bash -c "SCAN_PATTERN_EXEMPT_FILE='$WORK/v8.exempt' '$SCAN' tree '$D'"
+
+# old-commit guard
+GUARD="$WORK/guard"
+printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$BASH" "$HERE/old-commit-guard.sh" >"$GUARD"; chmod +x "$GUARD"
+D=$(mkrepo v8-guard README.txt base a.py 1 b.py 2); OLD=$(git -C "$D" rev-parse HEAD~1)
+printf '# first changed\n%s\n' "$OLD" >"$WORK/v8.deny"
+expect_msg 1 'BLOCKED' "guard: a listed reachable commit blocks" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny' HEAD"
+expect_msg 0 'checked 1 commits against 1 listed' "guard: history before the listed commit passes" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny' HEAD~2"
+printf '%s\n' "$FAKEID" >"$WORK/v8.deny2"
+expect 0 "guard: listed commits missing locally are fine" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny2' HEAD"
+printf '%s\n' "${OLD:0:12}" >"$WORK/v8.deny3"
+expect 2 "guard: a short commit id is refused" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny3' HEAD"
+printf 'not-a-commit\n' >"$WORK/v8.deny4"
+expect 2 "guard: a malformed line is an error" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny4' HEAD"
+printf '# nothing\n' >"$WORK/v8.deny5"
+expect 2 "guard: an empty denylist is an error" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny5' HEAD"
+expect 2 "guard: an unknown revision is an error" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny2' $FAKEID"
+expect 2 "guard: a missing denylist is an error" bash -c "cd '$D' && '$GUARD' '$WORK/none' HEAD"
+git clone -q --depth 1 "file://$D" "$WORK/v8-guard-shallow"
+expect_msg 2 'shallow repository' "guard: a shallow clone is refused" bash -c "cd '$WORK/v8-guard-shallow' && '$GUARD' '$WORK/v8.deny2' HEAD"
+git clone -q --bare "file://$D" "$WORK/v8-guard-grafts.git"; printf '%s\n' "$(git -C "$D" rev-parse HEAD)" >"$WORK/v8-guard-grafts.git/info/grafts"
+expect_msg 2 'grafted history' "guard: a grafted (bare) repository is refused" bash -c "cd '$WORK/v8-guard-grafts.git' && '$GUARD' '$WORK/v8.deny' HEAD"
+D2=$(mkrepo v8-guard-other other.txt x); git -C "$D" fetch -q "$D2" HEAD; OTHER=$(git -C "$D2" rev-parse HEAD)
+printf '%s\n' "$OTHER" >"$WORK/v8.deny6"
+expect 0 "guard: a listed commit in a disconnected history does not affect this history" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny6' HEAD"
+expect 1 "guard: several revisions are checked together" bash -c "cd '$D' && '$GUARD' '$WORK/v8.deny6' HEAD '$OTHER'"
 
 echo; echo "$pass passed, $failn failed"
 exit $(( failn > 0 ? 1 : 0 ))

@@ -6,14 +6,48 @@ A small, fail-closed scanner for pre-commit hooks, pre-push hooks and CI.
 security-scan.sh staged                 # staged changes (pre-commit)
 security-scan.sh range <base> <head>    # what <head> adds relative to <base> (pre-push, CI)
 security-scan.sh tree <dir>             # the files of a directory as they are (deploy payload)
+security-scan.sh history <head>         # every commit reachable from <head>, root commits included
+security-scan.sh new <head> <has-file>  # commits not reachable from the ids in <has-file> (a new branch)
+
+old-commit-guard.sh <denylist> <rev>... # refuse history containing commits a rewrite replaced
+rewrite-monitor.sh <url> <denylist> <dir>  # the same check on every branch and tag of a remote
 ```
 
-Run `staged` and `range` from the root of the repository's work tree (checked against
-`git rev-parse --show-toplevel`). Requires bash 3.2+, git 2.31+, perl 5.10+ and gitleaks 8.30.1.
+Run `staged`, `range`, `history` and `new` from the root of the repository's work tree (checked against
+`git rev-parse --show-toplevel`). `range`, `history` and `new` print `[security] scanned <N> commits
+(<mode>)`; `history` with no commit is an error. Requires bash 3.2+, git 2.31+, perl 5.14+ (for the core
+modules JSON::PP, Digest::SHA and Encode) and gitleaks 8.30.1.
+
+**`history` and `new`** exist for pushes whose remote tip is unknown or unrelated (after a history rewrite)
+and for new branches. `new` takes a file of full commit ids the push destination is known to have (a caller
+should read them from the destination itself, for example `git ls-remote`, not from local tracking refs);
+ids missing locally are skipped, which only widens the scan. In `history` mode `SCAN_ALLOW_DATA_FILES` is
+refused.
+
+**The guard** refuses shallow and grafted repositories (bare ones included), because their ancestry is
+incomplete or rewritten. Listed commits need not exist locally. **The monitor** fetches branches and tags
+only; pull request refs are read-only on GitHub and are checked separately.
+
+**Caller-only options (never under CI: refused when `GITHUB_ACTIONS` or `CI` is set).** Risky patterns come
+in two groups, both checked on added non-Markdown content. In Markdown, gitleaks runs as everywhere, plus
+material-aware checks: a private-key header followed by a key body, or an Entra secret value, blocks; prose
+that only names a PEM header does not.
+**Secret material** (private-key markers, Entra client secrets) always blocks. **Code patterns** (public
+objects, open rules, `NEXT_PUBLIC_` secret names, key loading, personal deploy tokens, install hooks) block
+unless:
+- `SCAN_PATTERN_REPORT=<file>` (history mode only): code-pattern hits are written as JSON lines instead of
+  blocking: `commit`, `parent` (a merge is reported once per parent; `ROOT` for a root commit), `path_hex`
+  (the exact path bytes; git's quoting decoded), `path` (for reading), `label`, `span_sha256` (SHA-256 of the
+  matched text) and `count`. Every other check still blocks. A local pre-push hook compares the report with
+  an approved baseline of historic findings.
+- `SCAN_PATTERN_EXEMPT_FILE=<file>`: units whose path is listed exactly skip the code-pattern checks only
+  (for the scanner's own repository, whose files contain the pattern text). Not supported in `tree` mode or
+  together with a report.
 
 **Checks:** secrets (gitleaks, required), credential/key files, `.env` files with secret-like values
-(every version in a range, including `export` and spaced assignments; `.env.example`, `.env.sample` and
-`.env.template` are skipped), client data files (spreadsheets, exports, dumps), submodules (gitlinks), and
+(every version in a range, including `export` and spaced assignments; a value starting with `#` counts,
+a `#` after spaces is a comment; only `.env.example` is skipped), client data files (spreadsheets, exports,
+dumps), submodules (gitlinks), and
 risky code patterns (public storage objects, open Firebase rules, service-account key loading, secrets exposed
 via `NEXT_PUBLIC_`, personal deploy tokens, install-script hooks). In a deploy payload (`tree`), symlinks, git
 metadata (`.git`) and archives are blocked too.
